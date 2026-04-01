@@ -350,7 +350,7 @@ class DirectMainWindow(QMainWindow):
 
         tb.addSeparator()
 
-        self._export_btn = self._tb_btn("Export CSV", "#1a1a0a", "#ddcc44")
+        self._export_btn = self._tb_btn("Export XLSX", "#1a1a0a", "#ddcc44")
         self._export_btn.clicked.connect(self._on_export_csv)
         self._export_btn.setEnabled(False)
         tb.addWidget(self._export_btn)
@@ -1852,26 +1852,28 @@ class DirectMainWindow(QMainWindow):
         if not self.db_path:
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export CSV", "", "CSV files (*.csv)")
+            self, "Export XLSX", "",
+            "Excel Workbook (*.xlsx);;All files (*)")
         if not path:
             return
-        import csv
-        rows = db.get_all_files(self.db_path)
-        headers = ["O-Number", "File Name", "Score", "Verify", "Status",
-                   "Title", "Folder", "Dup", "Path", "Notes"]
-        with open(path, "w", newline="", encoding="utf-8-sig") as fh:
-            w = csv.writer(fh)
-            w.writerow(headers)
-            for r in rows:
-                w.writerow([
-                    r["o_number"], r["file_name"],
-                    f"{r['verify_score']}/6", r["verify_status"],
-                    r["status"], r["program_title"], r["source_folder"],
-                    "[DUP]" if r["has_dup_flag"] else "",
-                    r["file_path"], r["notes"],
-                ])
-        QMessageBox.information(self, "Exported",
-            f"Wrote {len(rows)} rows to:\n{path}")
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+
+        from ui.export_xlsx import export_workbook
+        try:
+            used, free = export_workbook(self.db_path, path)
+        except Exception as exc:
+            import traceback
+            QMessageBox.critical(self, "Export Failed",
+                f"Could not write workbook:\n{exc}\n\n{traceback.format_exc()}")
+            return
+
+        QMessageBox.information(
+            self, "Export Complete",
+            f"Workbook saved to:\n{path}\n\n"
+            f"{used:,} indexed file(s)  •  {free:,} free O-number(s) across all ranges\n\n"
+            f"Sheets: All  +  one sheet per round size (5.75\" – 13.00\")"
+        )
 
     # ------------------------------------------------------------------
     # Export Files — copy files into round-size sub-folders

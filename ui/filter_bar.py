@@ -359,4 +359,5 @@ class FilterBar(QWidget):
         self._type_combo.setCurrentIndex(0)
         self._search_edit.clear()
         self._building = False
+        self._cascade()   # re-populate all spec combos with the full unfiltered option sets
         self._emit()

@@ -179,7 +179,7 @@ class _DirectProxy(QSortFilterProxyModel):
                 specs = _vfy.parse_title_specs(title)
                 if specs is None or specs.get("cb_mm") is None:
                     return False
-                if abs(specs["cb_mm"] - cb_val) > 1.0:
+                if abs(specs["cb_mm"] - cb_val) > 0.05:
                     return False
             except ValueError:
                 pass
@@ -192,21 +192,20 @@ class _DirectProxy(QSortFilterProxyModel):
                 specs = _vfy.parse_title_specs(title)
                 if specs is None or specs.get("ob_mm") is None:
                     return False
-                if abs(specs["ob_mm"] - ob_val) > 1.0:
+                if abs(specs["ob_mm"] - ob_val) > 0.05:
                     return False
             except ValueError:
                 pass
 
-        # Thickness (dropdown value is e.g. "20MM")
+        # Thickness (dropdown value is e.g. '0.750"')
         th_str = f.get("thickness")
         if th_str:
             try:
-                th_mm = float(th_str.replace("MM", "").replace("mm", "").strip())
-                th_in = th_mm / 25.4
+                th_in = float(th_str.replace('"', "").strip())
                 specs = _vfy.parse_title_specs(title)
                 if specs is None or specs.get("length_in") is None:
                     return False
-                if abs(specs["length_in"] - th_in) > 0.13:   # ~3 mm tolerance
+                if abs(specs["length_in"] - th_in) > 0.002:   # ±0.002" exact match
                     return False
             except (ValueError, AttributeError):
                 pass
@@ -877,12 +876,11 @@ class DirectMainWindow(QMainWindow):
                 continue
             th_in = s.get("length_in")
             hc_in = s.get("hc_height_in")
-            th_mm = round(th_in * 25.4) if th_in else None
             specs.append({
-                "rs":    s.get("round_size_in"),
-                "cb":    s.get("cb_mm"),
-                "ob":    s.get("ob_mm"),
-                "th_mm": th_mm,
+                "rs":   s.get("round_size_in"),
+                "cb":   s.get("cb_mm"),
+                "ob":   s.get("ob_mm"),
+                "th":   th_in,          # inches float, used directly
                 "hc_in": hc_in,
             })
         self._filter_bar.set_spec_data(specs)

@@ -55,14 +55,14 @@ _HC = "hc"    # hc_height_in   (float, inches), None = no hub
 def _rs_key(v):  return round(v, 2)
 def _cb_key(v):  return round(v, 1)
 def _ob_key(v):  return round(v, 1)
-def _th_key(v):  return round(v * 25.4)     # nearest-mm integer
+def _th_key(v):  return round(v, 3)         # inches, 3 decimal places
 def _hc_key(v):  return round(v * 1000)     # nearest-thou integer for bucketing
 
 
 def _rs_label(k): return f"{k:.2f}"
 def _cb_label(k): return f"{k:.1f}"
 def _ob_label(k): return f"{k:.1f}"
-def _th_label(k): return f"{k}MM"
+def _th_label(k): return f'{k:.3f}"'
 def _hc_label(k):
     v = k / 1000.0
     # Special display for common values
@@ -164,7 +164,7 @@ class FilterBar(QWidget):
         """
         self._specs = [s for s in specs
                        if any(s.get(k) is not None
-                              for k in (_RS, _CB, _OB, "th_mm", "hc_in"))]
+                              for k in (_RS, _CB, _OB, _TH, "hc_in"))]
         self._cascade()
 
     # ------------------------------------------------------------------
@@ -193,16 +193,22 @@ class FilterBar(QWidget):
                     continue
             if cb_sel is not None:
                 sv = s.get(_CB)
-                if sv is None or abs(_cb_key(sv) - float(cb_sel)) > 0.55:
+                try:
+                    if sv is None or abs(_cb_key(sv) - float(cb_sel)) > 0.05:
+                        continue
+                except (ValueError, TypeError):
                     continue
             if ob_sel is not None:
                 sv = s.get(_OB)
-                if sv is None or abs(_ob_key(sv) - float(ob_sel)) > 0.55:
+                try:
+                    if sv is None or abs(_ob_key(sv) - float(ob_sel)) > 0.05:
+                        continue
+                except (ValueError, TypeError):
                     continue
             if th_sel is not None:
-                sv = s.get("th_mm")
+                sv = s.get(_TH)
                 try:
-                    if sv is None or abs(sv - int(th_sel.replace("MM", "").strip())) > 1:
+                    if sv is None or abs(_th_key(sv) - float(th_sel.replace('"', "").strip())) > 0.002:
                         continue
                 except (ValueError, TypeError):
                     continue
@@ -266,7 +272,7 @@ class FilterBar(QWidget):
 
         # Thickness: specs matching current rs/cb/ob/hc
         th_pool = self._matching_specs(exclude=_TH)
-        th_vals = sorted({s["th_mm"] for s in th_pool if s.get("th_mm")})
+        th_vals = sorted({_th_key(s[_TH]) for s in th_pool if s.get(_TH)})
         self._populate_combo(self._thick_combo, th_vals, _th_label, th_prev)
 
         # Hub: specs matching current rs/cb/ob/th — always show "No Hub" option
@@ -334,7 +340,7 @@ class FilterBar(QWidget):
             "round_size":   self._sel(self._round_combo),
             "cb_mm":        self._sel(self._cb_combo),
             "ob_mm":        self._sel(self._ob_combo),
-            "thickness":    self._sel(self._thick_combo),
+            "thickness":    self._sel(self._thick_combo),   # e.g. '0.750"' or None
             "hub_height":   hub_height,
             "part_type":    part_type,
             "search":       self._search_edit.text().strip(),

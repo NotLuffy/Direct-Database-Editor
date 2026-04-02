@@ -441,6 +441,9 @@ class DirectMainWindow(QMainWindow):
         self._table.clicked.connect(self._on_table_row_changed)
         self._table.selectionModel().currentChanged.connect(
             lambda cur, _prev: self._on_table_row_changed(cur))
+        # Auto-compare when exactly 2 rows are selected (Ctrl+click)
+        self._table.selectionModel().selectionChanged.connect(
+            lambda _sel, _desel: self._on_selection_changed())
 
         # ── Vertical splitter: table (top) | panels (bottom) ──
         right_vsplit = QSplitter(Qt.Orientation.Vertical)
@@ -1060,6 +1063,10 @@ class DirectMainWindow(QMainWindow):
             menu.addAction("Revision History…",    lambda: self._action_revisions(rec))
             menu.addAction("View Toolpath…",        lambda: self._action_toolpath(rec))
             menu.addSeparator()
+        elif len(recs) == 2:
+            menu.addAction("Compare Selected",
+                           lambda: self._on_selection_changed())
+            menu.addSeparator()
 
         # Status sub-menu
         status_menu = menu.addMenu("Set Status")
@@ -1304,6 +1311,19 @@ class DirectMainWindow(QMainWindow):
                     title, derived, _internal_o, _has_gc = _extract_header_info(chunk)
                     header_found = True
         return h.hexdigest(), _count_lines(path), title, derived
+
+    def _on_selection_changed(self):
+        """Auto-compare when exactly 2 rows are selected (Ctrl+click)."""
+        recs = self._selected_records()
+        if len(recs) == 2:
+            a, b = recs[0], recs[1]
+            self._diff_panel.compare(
+                a["file_path"], a["file_name"],
+                b["file_path"], b["file_name"],
+            )
+            self._bottom_tabs.setCurrentWidget(self._diff_panel)
+            self._status_bar.showMessage(
+                f"Diff: {a['file_name']}  vs  {b['file_name']}")
 
     def _action_compare(self, rec: dict):
         """Two-click diff: first click sets File A, second fires diff panel."""

@@ -14,11 +14,12 @@ from PyQt6.QtCore import pyqtSignal, Qt
 
 class ToolsPanel(QWidget):
     # Signals fired when the user clicks each action button
-    recheck_ranges     = pyqtSignal()
-    auto_rename_range  = pyqtSignal()
-    auto_resolve_dupes = pyqtSignal()
-    open_batch_replace = pyqtSignal()
-    open_feed_audit    = pyqtSignal()
+    recheck_ranges          = pyqtSignal()
+    auto_rename_range       = pyqtSignal()
+    auto_resolve_dupes      = pyqtSignal()
+    open_batch_replace      = pyqtSignal()
+    open_feed_audit         = pyqtSignal()
+    open_new_progs_finder   = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -81,6 +82,19 @@ class ToolsPanel(QWidget):
             "Scan selected files for feed rate violations. "
             "Reports lines that exceed the configured maximum.",
             self.open_feed_audit,
+        ))
+
+        lay.addSpacing(12)
+
+        # ── File Management ───────────────────────────────────────────────
+        lay.addWidget(self._section_hdr("File Management"))
+
+        lay.addWidget(self._tool_btn(
+            "New Programs Finder",
+            "Scan New Programs subfolders and copy any file whose O-number is not "
+            "already in the Repository into New Programs\\new.  "
+            "Extension-agnostic: O10101.txt, O10101.NC, and O10101 all count as the same O-number.",
+            self.open_new_progs_finder,
         ))
 
         lay.addStretch()

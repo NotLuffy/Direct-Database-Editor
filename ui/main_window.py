@@ -484,6 +484,7 @@ class DirectMainWindow(QMainWindow):
         self._tools_panel.auto_resolve_dupes.connect(self._on_auto_resolve_dupes)
         self._tools_panel.open_batch_replace.connect(lambda: self._open_batch_replace())
         self._tools_panel.open_feed_audit.connect(lambda: self._open_feed_audit())
+        self._tools_panel.open_new_progs_finder.connect(self._open_new_progs_finder)
         self._bottom_tabs.addTab(self._tools_panel, "Tools")
 
         right_vsplit.addWidget(self._bottom_tabs)
@@ -1525,6 +1526,11 @@ class DirectMainWindow(QMainWindow):
         from ui.feed_audit import FeedAuditDialog
         dlg = FeedAuditDialog(self.db_path, file_ids=file_ids, parent=self)
         dlg.open_in_editor.connect(self._audit_open_editor)
+        dlg.show()
+
+    def _open_new_progs_finder(self):
+        from ui.new_programs_finder import NewProgramsFinderDialog
+        dlg = NewProgramsFinderDialog(parent=self)
         dlg.show()
 
     def _audit_open_editor(self, file_path: str, line_no: int):

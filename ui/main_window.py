@@ -1529,9 +1529,46 @@ class DirectMainWindow(QMainWindow):
         dlg.show()
 
     def _open_new_progs_finder(self):
-        from ui.new_programs_finder import NewProgramsFinderDialog
-        dlg = NewProgramsFinderDialog(parent=self)
-        dlg.show()
+        from ui.new_programs_finder import NewProgsFinder, REPO_PATH, NEW_PROGS_PATH
+        import os
+
+        if not os.path.isdir(REPO_PATH):
+            QMessageBox.warning(self, "New Programs Finder",
+                                f"Repository folder not found:\n{REPO_PATH}")
+            return
+        if not os.path.isdir(NEW_PROGS_PATH):
+            QMessageBox.warning(self, "New Programs Finder",
+                                f"New Programs folder not found:\n{NEW_PROGS_PATH}")
+            return
+
+        prog = QProgressDialog("Scanning folders…", None, 0, 0, self)
+        prog.setWindowTitle("New Programs Finder")
+        prog.setMinimumWidth(380)
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        prog.show()
+
+        self._new_progs_worker = NewProgsFinder(parent=self)
+        self._new_progs_worker.progress.connect(prog.setLabelText)
+        self._new_progs_worker.finished.connect(
+            lambda copied, skipped, errors, p=prog: self._on_new_progs_done(
+                copied, skipped, errors, p))
+        self._new_progs_worker.start()
+
+    def _on_new_progs_done(self, copied: int, skipped: int,
+                           errors: list, prog: "QProgressDialog"):
+        from ui.new_programs_finder import NEW_PROGS_PATH
+        prog.close()
+        new_folder = os.path.join(NEW_PROGS_PATH, "new")
+        if copied == 0 and not errors:
+            msg = "No new files found — everything in New Programs is already in Repository."
+        else:
+            lines = [f"{copied:,} file(s) copied to:\n{new_folder}"]
+            if skipped:
+                lines.append(f"{skipped:,} already existed — skipped.")
+            if errors:
+                lines.append(f"{len(errors):,} error(s):\n" + "\n".join(errors[:5]))
+            msg = "\n".join(lines)
+        QMessageBox.information(self, "New Programs Finder", msg)
 
     def _audit_open_editor(self, file_path: str, line_no: int):
         """Open a file in the editor tab and scroll to a line number."""

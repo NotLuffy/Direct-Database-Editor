@@ -4,11 +4,15 @@ CNC Direct Editor — Collapsible filter bar with cascading spec dropdowns.
 CB, OB, Thickness, and Hub dropdowns are populated from actual DB titles and
 update each other: selecting a round size narrows CB/OB/Thickness to only
 values that exist for that round size, and vice versa.
+
+Thickness supports multi-select (checkable menu) — multiple MM values can be
+active simultaneously and are matched with OR logic.
 """
 
 from PyQt6.QtWidgets import (
-    QWidget, QHBoxLayout, QLabel, QComboBox, QLineEdit, QPushButton
+    QWidget, QHBoxLayout, QLabel, QComboBox, QLineEdit, QPushButton, QMenu
 )
+from PyQt6.QtGui import QAction
 from PyQt6.QtCore import pyqtSignal
 
 _STATUSES = ["All", "active", "flagged", "review", "delete"]
@@ -48,24 +52,43 @@ QPushButton:hover { background: #222240; color: #8899bb; }
 _RS = "rs"    # round_size_in  (float, inches)
 _CB = "cb"    # cb_mm          (float, mm)
 _OB = "ob"    # ob_mm          (float, mm)
-_TH = "th"    # length_in      stored as nearest-mm integer (th_mm)
+_TH = "th"    # length_in      (float, inches) stored as-is
 _HC = "hc"    # hc_height_in   (float, inches), None = no hub
 
 
 def _rs_key(v):  return round(v, 2)
 def _cb_key(v):  return round(v, 1)
 def _ob_key(v):  return round(v, 1)
-def _th_key(v):  return round(v, 3)         # inches, 3 decimal places
-def _hc_key(v):  return round(v * 1000)     # nearest-thou integer for bucketing
+def _hc_key(v):  return round(v * 1000)       # nearest-thou integer for bucketing
 
 
 def _rs_label(k): return f"{k:.2f}"
 def _cb_label(k): return f"{k:.1f}"
 def _ob_label(k): return f"{k:.1f}"
-def _th_label(k): return f'{k:.3f}"'
+
+
+def _th_display_label(th_in: float, from_mm: bool) -> str:
+    """Format a thickness value in its original unit.
+    from_mm=True  → '31.8MM'   (title specified mm, e.g. '32MM')
+    from_mm=False → '1.250"'   (title specified inches, e.g. '1.25')
+    """
+    if from_mm:
+        return f"{th_in * 25.4:.1f}MM"
+    return f'{th_in:.3f}"'
+
+
+def _th_label_to_inches(label: str) -> tuple[float, float]:
+    """Parse a thickness label back to (value_in, tolerance_in).
+    Inch labels use ±0.002", MM labels use ±0.1mm (≈±0.004").
+    """
+    if label.endswith("MM"):
+        mm_val = float(label[:-2])
+        return mm_val / 25.4, 0.1 / 25.4
+    if label.endswith('"'):
+        return float(label[:-1]), 0.002
+    return 0.0, 0.002
 def _hc_label(k):
     v = k / 1000.0
-    # Special display for common values
     if abs(v - 0.5906) < 0.002:
         return '15MM (0.591")'
     return f'{v:.3f}"'
@@ -80,8 +103,12 @@ class FilterBar(QWidget):
         self.setStyleSheet(_STYLE)
         self.setFixedHeight(34)
         self._building = False
-        # Each entry: {rs, cb, ob, th_mm, hc_in}  (values may be None)
+        # Each entry: {rs, cb, ob, th, hc_in}  (values may be None)
         self._specs: list[dict] = []
+        # Set of MM label strings currently checked in the thickness menu
+        self._thick_selections: set[str] = set()
+        # All available MM thickness labels (for menu rebuild)
+        self._thick_all_labels: list[str] = []
         self._build()
 
     # ------------------------------------------------------------------
@@ -128,9 +155,24 @@ class FilterBar(QWidget):
         self._ob_combo = combo(["All"], 76,
                                on_change=self._on_spec_changed)
 
+        # Thickness — multi-select button + checkable menu
         lbl("Thick:")
-        self._thick_combo = combo(["All"], 76,
-                                  on_change=self._on_spec_changed)
+        self._thick_btn = QPushButton("All ▾")
+        self._thick_btn.setFixedWidth(148)
+        self._thick_btn.setStyleSheet(
+            "QPushButton { background: #1a1d2e; border: 1px solid #2a2d45; "
+            "color: #ccccdd; padding: 2px 5px; border-radius: 3px; "
+            "font-size: 11px; text-align: left; }"
+            "QPushButton:hover { background: #222240; }"
+        )
+        self._thick_menu = QMenu(self)
+        self._thick_menu.setStyleSheet(
+            "QMenu { background: #1a1d2e; color: #ccccdd; border: 1px solid #2a2d45; }"
+            "QMenu::item:selected { background: #2a3055; }"
+            "QMenu::item { padding: 3px 20px 3px 6px; font-size: 11px; }"
+        )
+        self._thick_btn.clicked.connect(self._show_thick_menu)
+        lay.addWidget(self._thick_btn)
 
         lbl("Hub:")
         self._hub_combo = combo(["All", "No Hub"], 96,
@@ -160,7 +202,7 @@ class FilterBar(QWidget):
     def set_spec_data(self, specs: list[dict]):
         """
         Receive pre-parsed spec rows from the main window.
-        Each row: {rs, cb, ob, th_mm, hc_in}  (all may be None).
+        Each row: {rs, cb, ob, th, hc_in}  (all may be None).
         """
         self._specs = [s for s in specs
                        if any(s.get(k) is not None
@@ -182,7 +224,9 @@ class FilterBar(QWidget):
         rs_sel  = self._sel(self._round_combo) if exclude != _RS else None
         cb_sel  = self._sel(self._cb_combo)    if exclude != _CB else None
         ob_sel  = self._sel(self._ob_combo)    if exclude != _OB else None
-        th_sel  = self._sel(self._thick_combo) if exclude != _TH else None
+        # For cascade narrowing, use first checked thickness label (if any)
+        th_label_sel = (next(iter(sorted(self._thick_selections)), None)
+                        if exclude != _TH else None)
         hc_text = self._sel(self._hub_combo)   if exclude != _HC else None
 
         out = []
@@ -205,10 +249,13 @@ class FilterBar(QWidget):
                         continue
                 except (ValueError, TypeError):
                     continue
-            if th_sel is not None:
+            if th_label_sel is not None:
                 sv = s.get(_TH)
+                if sv is None:
+                    continue
                 try:
-                    if sv is None or abs(_th_key(sv) - float(th_sel.replace('"', "").strip())) > 0.002:
+                    target_in, tol = _th_label_to_inches(th_label_sel)
+                    if abs(sv - target_in) > tol:
                         continue
                 except (ValueError, TypeError):
                     continue
@@ -245,6 +292,42 @@ class FilterBar(QWidget):
             combo.setCurrentText(preserve)
         combo.blockSignals(False)
 
+    def _show_thick_menu(self):
+        """Open the thickness checkable menu below the button."""
+        self._thick_menu.exec(
+            self._thick_btn.mapToGlobal(
+                self._thick_btn.rect().bottomLeft()))
+
+    def _rebuild_thick_menu(self, labels: list[str]):
+        """Rebuild the thickness checkable menu, restoring checked state."""
+        self._thick_menu.clear()
+        for label in labels:
+            action = QAction(label, self._thick_menu)
+            action.setCheckable(True)
+            action.setChecked(label in self._thick_selections)
+            action.triggered.connect(lambda checked, lbl=label: self._on_thick_toggled(lbl, checked))
+            self._thick_menu.addAction(action)
+        self._thick_all_labels = list(labels)
+        self._update_thick_btn_label()
+
+    def _update_thick_btn_label(self):
+        sel = sorted(self._thick_selections)
+        if not sel:
+            self._thick_btn.setText("All ▾")
+        elif len(sel) == 1:
+            self._thick_btn.setText(f"{sel[0]} ▾")
+        else:
+            self._thick_btn.setText(f"{len(sel)} selected ▾")
+
+    def _on_thick_toggled(self, label: str, checked: bool):
+        if checked:
+            self._thick_selections.add(label)
+        else:
+            self._thick_selections.discard(label)
+        self._update_thick_btn_label()
+        self._cascade()
+        self._emit()
+
     def _cascade(self):
         """Recompute available options for all five spec combos."""
         self._building = True
@@ -252,7 +335,6 @@ class FilterBar(QWidget):
         rs_prev = self._sel(self._round_combo)
         cb_prev = self._sel(self._cb_combo)
         ob_prev = self._sel(self._ob_combo)
-        th_prev = self._sel(self._thick_combo)
         hc_prev = self._sel(self._hub_combo)
 
         # Round size: specs matching current cb/ob/th/hc
@@ -270,10 +352,29 @@ class FilterBar(QWidget):
         ob_vals = sorted({_ob_key(s[_OB]) for s in ob_pool if s.get(_OB)})
         self._populate_combo(self._ob_combo, ob_vals, _ob_label, ob_prev)
 
-        # Thickness: specs matching current rs/cb/ob/hc
+        # Thickness: specs matching current rs/cb/ob/hc — rebuild checkable menu
+        # Preserve original format: inch-specified → '1.250"', MM-specified → '31.8MM'
         th_pool = self._matching_specs(exclude=_TH)
-        th_vals = sorted({_th_key(s[_TH]) for s in th_pool if s.get(_TH)})
-        self._populate_combo(self._thick_combo, th_vals, _th_label, th_prev)
+        seen_th: set[str] = set()
+        th_labels: list[str] = []
+        for s in th_pool:
+            th_in = s.get(_TH)
+            if th_in is None:
+                continue
+            lbl = _th_display_label(th_in, s.get("th_from_mm", False))
+            if lbl not in seen_th:
+                seen_th.add(lbl)
+                th_labels.append(lbl)
+        # Sort: inches first (ascending), then MM (ascending)
+        def _th_sort_key(lbl: str):
+            if lbl.endswith('"'):
+                return (0, float(lbl[:-1]))
+            mm_val = float(lbl[:-2]) if lbl.endswith("MM") else 0.0
+            return (1, mm_val)
+        th_labels.sort(key=_th_sort_key)
+        # Remove any checked selections that no longer appear in this pool
+        self._thick_selections &= set(th_labels)
+        self._rebuild_thick_menu(th_labels)
 
         # Hub: specs matching current rs/cb/ob/th — always show "No Hub" option
         hc_pool = self._matching_specs(exclude=_HC)
@@ -323,7 +424,6 @@ class FilterBar(QWidget):
         elif hc_text == "No Hub":
             hub_height = "none"
         else:
-            # Parse back the inch value from the label (e.g. '0.591"' → '0.591')
             try:
                 if "15MM" in hc_text:
                     hub_height = str(round(15.0 / 25.4, 4))
@@ -331,6 +431,9 @@ class FilterBar(QWidget):
                     hub_height = str(float(hc_text.replace('"', "").strip()))
             except ValueError:
                 hub_height = None
+
+        # Thickness: list of selected MM labels, or None if none selected
+        thickness = sorted(self._thick_selections) if self._thick_selections else None
 
         return {
             "status":       status,
@@ -340,7 +443,7 @@ class FilterBar(QWidget):
             "round_size":   self._sel(self._round_combo),
             "cb_mm":        self._sel(self._cb_combo),
             "ob_mm":        self._sel(self._ob_combo),
-            "thickness":    self._sel(self._thick_combo),   # e.g. '0.750"' or None
+            "thickness":    thickness,   # list[str] | None  e.g. ["20.0MM", "25.4MM"]
             "hub_height":   hub_height,
             "part_type":    part_type,
             "search":       self._search_edit.text().strip(),
@@ -354,7 +457,8 @@ class FilterBar(QWidget):
         self._round_combo.setCurrentIndex(0)
         self._cb_combo.setCurrentIndex(0)
         self._ob_combo.setCurrentIndex(0)
-        self._thick_combo.setCurrentIndex(0)
+        self._thick_selections.clear()
+        self._update_thick_btn_label()
         self._hub_combo.setCurrentIndex(0)
         self._type_combo.setCurrentIndex(0)
         self._search_edit.clear()

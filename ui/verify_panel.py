@@ -11,7 +11,7 @@ import os
 import html as _html
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QScrollArea,
-    QFrame, QSizePolicy,
+    QFrame, QSizePolicy, QPushButton, QDialog, QTextBrowser,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QColor
@@ -125,13 +125,31 @@ class VerifyPanel(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # Header bar
+        # Header bar (HBox: label + legend button)
+        hdr_widget = QWidget()
+        hdr_widget.setFixedHeight(26)
+        hdr_widget.setStyleSheet(
+            "background:#12131e; border-bottom:1px solid #1e2038;")
+        hdr_lay = QHBoxLayout(hdr_widget)
+        hdr_lay.setContentsMargins(8, 0, 4, 0)
+        hdr_lay.setSpacing(4)
+
         self._hdr = QLabel("  Select a file to see verification results.")
-        self._hdr.setStyleSheet(
-            "background:#12131e; color:#556688; font-size:11px;"
-            " padding:4px 8px; border-bottom:1px solid #1e2038;")
-        self._hdr.setFixedHeight(26)
-        root.addWidget(self._hdr)
+        self._hdr.setStyleSheet("color:#556688; font-size:11px; background:transparent;")
+        hdr_lay.addWidget(self._hdr, stretch=1)
+
+        legend_btn = QPushButton("Legend ?")
+        legend_btn.setFixedHeight(20)
+        legend_btn.setStyleSheet(
+            "QPushButton { background:#1a2030; border:1px solid #2a3d55;"
+            " color:#66aadd; border-radius:3px; font-size:10px;"
+            " padding:1px 8px; }"
+            "QPushButton:hover { background:#1e3448; color:#88ccff; }"
+        )
+        legend_btn.clicked.connect(self._show_legend)
+        hdr_lay.addWidget(legend_btn)
+
+        root.addWidget(hdr_widget)
 
         # Scrollable content area
         scroll = QScrollArea()
@@ -177,6 +195,92 @@ class VerifyPanel(QWidget):
     def clear(self):
         self._current_path = ""
         self._show_message("Select a file to see verification results.")
+
+    def _show_legend(self):
+        """Show a non-modal dialog explaining every verify token."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Verification Legend")
+        dlg.setMinimumSize(520, 420)
+        dlg.setStyleSheet(
+            "QDialog { background:#0d0e18; color:#ccccdd; }"
+            "QTextBrowser { background:#0f1018; color:#ccccdd;"
+            " border:1px solid #1e2038; font-size:11px; }"
+        )
+        lay = QVBoxLayout(dlg)
+        browser = QTextBrowser()
+        browser.setOpenExternalLinks(False)
+        browser.setHtml("""
+<style>
+  body { font-family: Consolas, monospace; font-size: 11px; color: #ccccdd; }
+  h2   { color: #8899bb; font-size: 13px; margin: 10px 0 4px 0; }
+  table { border-collapse: collapse; width: 100%%; }
+  td, th { padding: 4px 8px; border-bottom: 1px solid #1e2038; text-align: left; }
+  th { color: #8899bb; }
+  .pass { color: #44ee88; font-weight: bold; }
+  .fail { color: #ff5555; font-weight: bold; }
+  .nf   { color: #555577; }
+  .tok  { color: #66aadd; font-weight: bold; }
+  .desc { color: #aaaacc; }
+</style>
+
+<h2>Scored Checks (6 total &mdash; each adds 1 to score when PASS)</h2>
+<table>
+  <tr><th>Token</th><th>Name</th><th>What It Checks</th></tr>
+  <tr>
+    <td class="tok">CB</td><td>Center Bore</td>
+    <td class="desc">OP1 bore diameter (T303 X-value) matches title CB spec &plusmn;0.5mm</td>
+  </tr>
+  <tr>
+    <td class="tok">OB</td><td>Outer Bore</td>
+    <td class="desc">Second bore pass (HC/STEP/2PC hub bore) matches title OB spec &plusmn;0.5mm.
+    Standard parts with no OB show NF.</td>
+  </tr>
+  <tr>
+    <td class="tok">DR</td><td>Drill Depth</td>
+    <td class="desc">T101 drill (G81/G83) Z-depth matches -(total_thickness + 0.15").
+    15MM HC always expects Z-1.15". Dual drills checked on sum.</td>
+  </tr>
+  <tr>
+    <td class="tok">OD</td><td>OD Turn</td>
+    <td class="desc">Outside-diameter pass in OP1 and OP2 matches the OD table for the
+    round size &plusmn;0.015" (e.g. 5.75&quot; round &rarr; 5.700&quot; OD).</td>
+  </tr>
+  <tr>
+    <td class="tok">PC</td><td>P-Code</td>
+    <td class="desc">G154 P## work-offset number matches the lookup table for the
+    round size + total thickness (lathe 1 vs lathe 2/3).</td>
+  </tr>
+  <tr>
+    <td class="tok">HM</td><td>Home Position</td>
+    <td class="desc">G53 X-11 Z-## return-home move. Z must match total thickness:<br>
+    &le;2.50&quot; &rarr; Z-13 &nbsp;|&nbsp; 2.75&ndash;3.75&quot; &rarr; Z-11 &nbsp;|&nbsp;
+    4.0&ndash;5.0&quot; &rarr; Z-9 &nbsp;|&nbsp; &gt;5.0&quot; &rarr; NF</td>
+  </tr>
+</table>
+
+<h2>Result Tokens</h2>
+<table>
+  <tr><th>Status</th><th>Meaning</th></tr>
+  <tr><td class="pass">PASS</td><td class="desc">G-code value found and within tolerance</td></tr>
+  <tr><td class="fail">FAIL</td><td class="desc">G-code value found but outside tolerance</td></tr>
+  <tr><td class="nf">NF</td><td class="desc">Not Found &mdash; could not locate the G-code block (scores 0, not a penalty)</td></tr>
+  <tr><td style="color:#ffaa33;font-weight:bold">LOOSE</td>
+      <td class="desc">CB bore found but tolerance is wider than standard (hub bore variant)</td></tr>
+</table>
+
+<h2>2PC-Only Tokens (not scored)</h2>
+<table>
+  <tr><th>Token</th><th>Meaning</th></tr>
+  <tr><td class="tok">RC:&lt;val&gt;</td><td class="desc">Recess X diameter found in G-code (for Piece B pairing)</td></tr>
+  <tr><td class="tok">HB:&lt;val&gt;</td><td class="desc">Hub outside diameter found in G-code</td></tr>
+  <tr><td class="tok">IH:&lt;val&gt;</td><td class="desc">Implicit hub height inferred from G-code (not stated in title)</td></tr>
+</table>
+""")
+        lay.addWidget(browser)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.close)
+        lay.addWidget(close_btn)
+        dlg.show()
 
     # ── Slots ─────────────────────────────────────────────────────────────────
 

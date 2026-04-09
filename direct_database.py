@@ -114,6 +114,7 @@ def init_schema(db_path: str):
             "ALTER TABLE files ADD COLUMN internal_o_number TEXT    DEFAULT ''",
             "ALTER TABLE files ADD COLUMN no_eop_flag       INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE files ADD COLUMN has_range_conflict INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE files ADD COLUMN created_via TEXT DEFAULT ''",
         ]:
             try:
                 conn.execute(col_sql)
@@ -262,6 +263,21 @@ def get_file_by_path(db_path: str, file_path: str):
     return row
 
 
+def get_files_by_index_date(db_path: str, date_str: str) -> list:
+    """Return files created via New File Creator on *date_str* (YYYY-MM-DD)."""
+    # Ensure schema migrations have run (adds created_via column if missing)
+    init_schema(db_path)
+    conn = get_connection(db_path)
+    rows = conn.execute(
+        "SELECT * FROM files "
+        "WHERE date(index_date) = ? AND created_via = 'new_file_creator' "
+        "ORDER BY o_number",
+        (date_str,)
+    ).fetchall()
+    conn.close()
+    return rows
+
+
 def get_all_paths(db_path: str) -> dict:
     """Return {file_path: row} for all files. Used by scanner for merge."""
     conn = get_connection(db_path)
@@ -279,20 +295,21 @@ def upsert_file(db_path: str, conn: sqlite3.Connection, record: dict):
     r.setdefault("internal_o_number",  "")
     r.setdefault("no_eop_flag",        0)
     r.setdefault("has_range_conflict", 0)
+    r.setdefault("created_via",       "")
     conn.execute("""
         INSERT INTO files (
             file_path, file_name, o_number, o_suffix, file_hash,
             line_count, program_title, derived_from, source_folder,
             status, verify_status, verify_score, has_dup_flag,
             has_onum_mismatch, no_gcode_flag, internal_o_number,
-            no_eop_flag, has_range_conflict,
+            no_eop_flag, has_range_conflict, created_via,
             notes, last_seen, last_modified, index_date
         ) VALUES (
             :file_path, :file_name, :o_number, :o_suffix, :file_hash,
             :line_count, :program_title, :derived_from, :source_folder,
             :status, :verify_status, :verify_score, :has_dup_flag,
             :has_onum_mismatch, :no_gcode_flag, :internal_o_number,
-            :no_eop_flag, :has_range_conflict,
+            :no_eop_flag, :has_range_conflict, :created_via,
             :notes, :last_seen, :last_modified, :index_date
         )
         ON CONFLICT(file_path) DO UPDATE SET
@@ -315,7 +332,7 @@ def upsert_file(db_path: str, conn: sqlite3.Connection, record: dict):
             last_seen          = excluded.last_seen,
             last_modified      = excluded.last_modified,
             notes              = excluded.notes
-            -- status is NOT updated on conflict: preserve user value
+            -- status and created_via are NOT updated on conflict: preserve user values
     """, r)
 
 

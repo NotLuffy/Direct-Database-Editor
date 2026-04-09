@@ -59,6 +59,7 @@ COLUMNS = [
     ("o_number",      "O-Number"),
     ("file_name",     "File Name"),
     ("verify_score",  "Score"),
+    ("line_count",    "Lines"),
     ("status",        "Status"),
     ("part_type",     "Type"),
     ("program_title", "Title"),
@@ -122,7 +123,8 @@ def _part_type(title: str) -> str:
         return "LUG"
     if re.search(r'\bSTUD\b', title, _PT):
         return "STUD"
-    if re.search(r'\bHC\b', title, _PT):
+    specs = _verifier.parse_title_specs(title)
+    if specs is not None and specs.get("hc_height_in") is not None:
         return "HC"
     return "STD"
 
@@ -232,6 +234,8 @@ class DirectFileTableModel(QAbstractTableModel):
                 return _STATUS_LABELS.get(st, st.upper())
             if key == "verify_score":
                 return f"{val}/6" if val is not None else "—"
+            if key == "line_count":
+                return str(val) if val else "—"
             if key == "has_dup_flag":
                 return "[DUP]" if val else ""
             if key == "source_folder":

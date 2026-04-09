@@ -13,6 +13,7 @@ Each sheet:
   - N/A in cells that don't apply to the file type
 """
 
+import os
 import re
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
@@ -116,6 +117,38 @@ def _o_int(o_number: str) -> int:
 # Type sort order
 # ---------------------------------------------------------------------------
 
+_ONUM_FNAME_RE = re.compile(r'^O(\d{4,6})(?:_\d+)?', re.IGNORECASE)
+
+
+def _rs_label_for_o(o_int: int) -> str:
+    """Return the round-size display string for an O-number, e.g. '5.75"'."""
+    for _name, round_sizes, o_min, o_max in _ROUND_SHEETS:
+        if o_min <= o_int <= o_max:
+            return "/".join(f'{rs:.2f}"' for rs in round_sizes)
+    return ""
+
+
+def _scan_folder_o_ints(folder: str) -> set[int]:
+    """Walk a folder on disk and return every O-number integer found in filenames.
+    Used to catch files that are on disk but not yet in the DB.
+    """
+    result: set[int] = set()
+    try:
+        for root, dirs, files in os.walk(folder):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for fname in files:
+                base = os.path.splitext(fname)[0]
+                m = _ONUM_FNAME_RE.match(base)
+                if m:
+                    try:
+                        result.add(int(m.group(1)))
+                    except ValueError:
+                        pass
+    except Exception:
+        pass
+    return result
+
+
 _TYPE_ORDER = {
     "STD": 0, "HC": 1, "15MM HC": 2, "2PC": 3,
     "STEP": 4, "STEEL": 5, "SPACER": 6, "LUG": 7, "STUD": 8,
@@ -148,6 +181,8 @@ def _build_row(rec) -> dict:
 
     vstatus = rec["verify_status"] or ""
 
+    th_disp = f"{th_in * 25.4:.1f}MM" if th_in is not None else "N/A"
+
     return {
         # Display columns (in header order)
         "o_number":  rec["o_number"] or "",
@@ -155,7 +190,7 @@ def _build_row(rec) -> dict:
         "rs_disp":   f'{rs_in:.2f}"' if rs_in else "N/A",
         "cb":        _fmt_mm(cb_mm),
         "ob":        _fmt_mm(ob_mm),         # N/A when ob_mm is None
-        "thickness": _fmt_in(th_in),
+        "thickness": th_disp,
         "hub":       _fmt_hub(hc_in),
         "type":      ptype,
         "notes":     (rec["notes"] or "").replace("\n", " ")[:200],
@@ -173,12 +208,18 @@ def _build_row(rec) -> dict:
 # Write one worksheet
 # ---------------------------------------------------------------------------
 
+_RS_COL = 3   # 1-based index of "Round Size" in _HEADERS
+
+
 def _write_sheet(ws, used_rows: list[dict], free_onums: list[int],
-                 sort_include_rs: bool = False) -> None:
+                 sort_by_onum: bool = False,
+                 free_rs_label: str | None = None) -> None:
     """
     Write header + used rows (sorted) + FREE rows to *ws*.
 
-    sort_include_rs: include round_size in the sort key (True for the All sheet).
+    sort_by_onum  : sort by O-number ascending (True for the All sheet).
+    free_rs_label : fixed round-size label for all FREE rows on this sheet.
+                    When None (All sheet) the label is looked up per O-number.
     """
 
     # ── Header ───────────────────────────────────────────────────────────
@@ -191,7 +232,10 @@ def _write_sheet(ws, used_rows: list[dict], free_onums: list[int],
     ws.row_dimensions[1].height = 18
 
     # ── Used rows ────────────────────────────────────────────────────────
-    sorted_rows = sorted(used_rows, key=_sort_key)
+    if sort_by_onum:
+        sorted_rows = sorted(used_rows, key=lambda r: r["_onum"])
+    else:
+        sorted_rows = sorted(used_rows, key=_sort_key)
 
     row_i = 2
     for r in sorted_rows:
@@ -213,8 +257,14 @@ def _write_sheet(ws, used_rows: list[dict], free_onums: list[int],
     # ── FREE rows ────────────────────────────────────────────────────────
     for o_int in sorted(free_onums):
         o_str = f"O{o_int:05d}"
+        rs    = free_rs_label if free_rs_label is not None else _rs_label_for_o(o_int)
         for col_i in range(1, len(_HEADERS) + 1):
-            val  = o_str if col_i == 1 else "FREE"
+            if col_i == 1:
+                val = o_str
+            elif col_i == _RS_COL:
+                val = rs          # round size always populated for FREE rows
+            else:
+                val = "FREE"
             cell = ws.cell(row=row_i, column=col_i, value=val)
             cell.fill = _FREE_FILL
             cell.font = _FREE_ONUM if col_i == 1 else _FREE_FONT
@@ -229,24 +279,42 @@ def _write_sheet(ws, used_rows: list[dict], free_onums: list[int],
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def export_workbook(db_path: str, out_path: str) -> tuple[int, int]:
+def export_workbook(db_path: str, out_path: str,
+                    scan_folders: list[str] | None = None) -> tuple[int, int]:
     """
     Build and save the multi-sheet .xlsx workbook.
+
+    scan_folders: when provided, the export also walks these directories on disk
+                  to catch files that exist on disk but haven't been imported into
+                  the DB yet — they still count as "used" and won't show as FREE.
 
     Returns (used_count, total_free_count).
     """
     conn = db.get_connection(db_path)
+    # Display rows: files that have been scanned (last_seen IS NOT NULL)
     db_rows = conn.execute(
         "SELECT o_number, program_title, verify_status, notes "
         "FROM files WHERE last_seen IS NOT NULL ORDER BY o_number"
     ).fetchall()
+    # Used set: ALL files in DB — so anything imported (even without rescan)
+    # does not appear as FREE
+    all_o_rows = conn.execute(
+        "SELECT o_number FROM files WHERE o_number IS NOT NULL"
+    ).fetchall()
     conn.close()
 
-    # Build enriched row dicts for every indexed file
+    # Build enriched row dicts for every scanned file
     all_built: list[dict] = [_build_row(r) for r in db_rows]
 
-    # Set of O-number integers already in DB (for FREE detection)
-    used_o_ints: set[int] = {r["_onum"] for r in all_built}
+    # Start with every O-number in the DB
+    used_o_ints: set[int] = {_o_int(r["o_number"]) for r in all_o_rows}
+    used_o_ints.discard(0)
+
+    # Also walk scan_folders on disk — catches files present on disk but not yet
+    # imported into the DB (e.g. newly added .nc files not yet rescanned)
+    if scan_folders:
+        for folder in scan_folders:
+            used_o_ints |= _scan_folder_o_ints(folder)
 
     wb = openpyxl.Workbook()
     wb.remove(wb.active)   # drop the default blank sheet
@@ -257,11 +325,11 @@ def export_workbook(db_path: str, out_path: str) -> tuple[int, int]:
         all_free.extend(o for o in range(o_min, o_max + 1) if o not in used_o_ints)
 
     ws_all = wb.create_sheet(title="All")
-    _write_sheet(ws_all, all_built, all_free, sort_include_rs=True)
+    # All sheet: free_rs_label=None → looked up per O-number
+    _write_sheet(ws_all, all_built, all_free, sort_by_onum=True)
 
     # ── Per-round-size sheets ─────────────────────────────────────────────
     for sheet_name, round_sizes, o_min, o_max in _ROUND_SHEETS:
-        # Match rows whose round_size falls within this sheet's set
         sheet_rows = [
             r for r in all_built
             if any(abs(r["_rs"] - rs) < 0.01 for rs in round_sizes)
@@ -269,8 +337,38 @@ def export_workbook(db_path: str, out_path: str) -> tuple[int, int]:
         free_nums = [
             o for o in range(o_min, o_max + 1) if o not in used_o_ints
         ]
+        # Fixed label for all FREE rows on this per-round sheet
+        rs_label = "/".join(f'{rs:.2f}"' for rs in round_sizes)
         ws = wb.create_sheet(title=sheet_name)
-        _write_sheet(ws, sheet_rows, free_nums, sort_include_rs=False)
+        _write_sheet(ws, sheet_rows, free_nums,
+                     sort_by_onum=False, free_rs_label=rs_label)
 
     wb.save(out_path)
     return len(all_built), len(all_free)
+
+
+# ---------------------------------------------------------------------------
+# Daily report — files created on a specific date
+# ---------------------------------------------------------------------------
+
+def export_daily_report(db_path: str, out_path: str, date_str: str) -> int:
+    """
+    Export a single-sheet workbook listing files created on *date_str*.
+
+    date_str: YYYY-MM-DD.
+    Returns the number of rows written.
+    """
+    rows = db.get_files_by_index_date(db_path, date_str)
+    if not rows:
+        return 0
+
+    built = [_build_row(r) for r in rows]
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = date_str   # sheet named after the date
+
+    _write_sheet(ws, built, [], sort_by_onum=True)
+
+    wb.save(out_path)
+    return len(built)

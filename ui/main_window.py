@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QTableView, QHeaderView, QAbstractItemView, QLabel, QPushButton,
     QFileDialog, QMessageBox, QToolBar, QStatusBar, QMenu, QDialog,
     QFormLayout, QLineEdit, QDialogButtonBox, QInputDialog, QCheckBox,
-    QTabWidget, QProgressDialog
+    QTabWidget, QProgressDialog, QCalendarWidget
 )
 from PyQt6.QtCore import Qt, QSortFilterProxyModel, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QAction, QColor
@@ -197,18 +197,21 @@ class _DirectProxy(QSortFilterProxyModel):
             except ValueError:
                 pass
 
-        # Thickness (dropdown value is e.g. '0.750"')
-        th_str = f.get("thickness")
-        if th_str:
-            try:
-                th_in = float(th_str.replace('"', "").strip())
-                specs = _vfy.parse_title_specs(title)
-                if specs is None or specs.get("length_in") is None:
-                    return False
-                if abs(specs["length_in"] - th_in) > 0.002:   # ±0.002" exact match
-                    return False
-            except (ValueError, AttributeError):
-                pass
+        # Thickness: list of labels e.g. ['1.250"', '31.8MM'] — OR logic
+        th_list = f.get("thickness")
+        if th_list:
+            specs = _vfy.parse_title_specs(title)
+            th_in = (specs or {}).get("length_in")
+            if th_in is None:
+                return False
+            def _lbl_match(lbl: str, val_in: float) -> bool:
+                if lbl.endswith("MM"):
+                    return abs(val_in - float(lbl[:-2]) / 25.4) <= 0.1 / 25.4
+                if lbl.endswith('"'):
+                    return abs(val_in - float(lbl[:-1])) <= 0.002
+                return False
+            if not any(_lbl_match(lbl, th_in) for lbl in th_list):
+                return False
 
         # Hub height
         hub_str = f.get("hub_height")
@@ -354,6 +357,13 @@ class DirectMainWindow(QMainWindow):
         self._export_btn.setEnabled(False)
         tb.addWidget(self._export_btn)
 
+        self._daily_report_btn = self._tb_btn("Daily Report", "#1a1a0a", "#ccaa44")
+        self._daily_report_btn.setToolTip(
+            "Generate an XLSX report of all files created on a chosen date")
+        self._daily_report_btn.clicked.connect(self._on_daily_report)
+        self._daily_report_btn.setEnabled(False)
+        tb.addWidget(self._daily_report_btn)
+
         self._export_files_btn = self._tb_btn("Export Files", "#0a1a0a", "#55ee88")
         self._export_files_btn.clicked.connect(self._on_export_files)
         self._export_files_btn.setEnabled(False)
@@ -363,6 +373,13 @@ class DirectMainWindow(QMainWindow):
         self._twopc_btn.clicked.connect(self._on_twopc)
         self._twopc_btn.setEnabled(False)
         tb.addWidget(self._twopc_btn)
+
+        self._new_file_btn = self._tb_btn("New File", "#0a1a12", "#44ddaa")
+        self._new_file_btn.setToolTip(
+            "Create a new G-code file and add it directly to the database")
+        self._new_file_btn.clicked.connect(self._on_new_file)
+        self._new_file_btn.setEnabled(False)
+        tb.addWidget(self._new_file_btn)
 
         self._settings_btn = self._tb_btn("Settings", "#0a0a1a", "#8899ff")
         self._settings_btn.clicked.connect(self._on_settings)
@@ -424,13 +441,14 @@ class DirectMainWindow(QMainWindow):
         hdr.resizeSection(0, 80)   # O-Number
         hdr.resizeSection(1, 130)  # File Name
         hdr.resizeSection(2, 55)   # Score
-        hdr.resizeSection(3, 70)   # Status
-        hdr.resizeSection(4, 65)   # Type
-        hdr.resizeSection(5, 220)  # Title
-        hdr.resizeSection(6, 100)  # Folder
-        hdr.resizeSection(7, 35)   # Dup
-        hdr.resizeSection(8, 260)  # Path
-        hdr.resizeSection(9, 140)  # Notes
+        hdr.resizeSection(3, 58)   # Lines
+        hdr.resizeSection(4, 70)   # Status
+        hdr.resizeSection(5, 65)   # Type
+        hdr.resizeSection(6, 220)  # Title
+        hdr.resizeSection(7, 100)  # Folder
+        hdr.resizeSection(8, 35)   # Dup
+        hdr.resizeSection(9, 260)  # Path
+        hdr.resizeSection(10, 140) # Notes
         # Verify (last) stretches to fill
 
         # Colored token delegate for the Verify column
@@ -515,6 +533,7 @@ class DirectMainWindow(QMainWindow):
         if chosen and chosen.data() is not None:
             col = chosen.data()
             hdr.setSectionHidden(col, not hdr.isSectionHidden(col))
+            self._save_config()
 
     def _tb_btn(self, text: str, bg: str, fg: str) -> QPushButton:
         btn = QPushButton(text)
@@ -542,15 +561,23 @@ class DirectMainWindow(QMainWindow):
                 self.db_path      = db_path
                 self.scan_folders = [f for f in folders if os.path.isdir(f)]
                 self._on_workspace_ready()
+            # Restore hidden columns (applies whether or not a DB was loaded)
+            hdr = self._table.horizontalHeader()
+            for col in cfg.get("hidden_columns", []):
+                if 0 <= col < len(COLUMNS):
+                    hdr.setSectionHidden(col, True)
         except Exception:
             pass
 
     def _save_config(self):
         try:
+            hdr = self._table.horizontalHeader()
+            hidden = [i for i in range(len(COLUMNS)) if hdr.isSectionHidden(i)]
             with open(self.config_path, "w") as f:
                 json.dump({
-                    "scan_folders": self.scan_folders,
-                    "db_path":      self.db_path,
+                    "scan_folders":  self.scan_folders,
+                    "db_path":       self.db_path,
+                    "hidden_columns": hidden,
                 }, f, indent=2)
         except Exception:
             pass
@@ -671,6 +698,8 @@ class DirectMainWindow(QMainWindow):
         self._export_files_btn.setEnabled(False)
         self._twopc_btn.setEnabled(False)
         self._reverify_btn.setEnabled(False)
+        self._new_file_btn.setEnabled(False)
+        self._daily_report_btn.setEnabled(False)
         self._sidebar.update_counts({}, {}, {}, {}, {})
         self._table_header.setText("  Files  (0)")
         self._status_bar.showMessage("Folders disconnected. Database and files are untouched.")
@@ -686,6 +715,8 @@ class DirectMainWindow(QMainWindow):
         self._export_btn.setEnabled(True)
         self._export_files_btn.setEnabled(True)
         self._twopc_btn.setEnabled(True)
+        self._new_file_btn.setEnabled(True)
+        self._daily_report_btn.setEnabled(True)
 
         # Propagate db_path to panels that need it
         self._editor_panel.db_path = self.db_path
@@ -878,14 +909,16 @@ class DirectMainWindow(QMainWindow):
                 continue
             if s is None:
                 continue
-            th_in = s.get("length_in")
-            hc_in = s.get("hc_height_in")
+            th_in      = s.get("length_in")
+            th_from_mm = bool(s.get("length_from_mm", False))
+            hc_in      = s.get("hc_height_in")
             specs.append({
-                "rs":   s.get("round_size_in"),
-                "cb":   s.get("cb_mm"),
-                "ob":   s.get("ob_mm"),
-                "th":   th_in,          # inches float, used directly
-                "hc_in": hc_in,
+                "rs":         s.get("round_size_in"),
+                "cb":         s.get("cb_mm"),
+                "ob":         s.get("ob_mm"),
+                "th":         th_in,       # always inches
+                "th_from_mm": th_from_mm,  # True → was MM in title
+                "hc_in":      hc_in,
             })
         self._filter_bar.set_spec_data(specs)
 
@@ -1570,6 +1603,81 @@ class DirectMainWindow(QMainWindow):
             msg = "\n".join(lines)
         QMessageBox.information(self, "New Programs Finder", msg)
 
+    def _on_new_file(self):
+        if not self.db_path or not self.scan_folders:
+            return
+        from ui.new_file_creator import NewFileCreatorDialog
+        dlg = NewFileCreatorDialog(self.db_path, self.scan_folders, self)
+        dlg.file_created.connect(lambda _path: self._refresh_all())
+        dlg.exec()
+
+    def _on_daily_report(self):
+        if not self.db_path:
+            return
+
+        # Date picker dialog
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Daily Report — Pick Date")
+        dlg.setStyleSheet(
+            "QDialog { background:#0d0e18; color:#ccccdd; }"
+            "QLabel  { color:#aaaacc; font-size:11px; }"
+            "QCalendarWidget { background:#0f1018; color:#ccccdd; }"
+            "QCalendarWidget QToolButton { color:#ccccdd; background:#1a1d2e; }"
+            "QCalendarWidget QMenu { background:#1a1d2e; color:#ccccdd; }"
+            "QCalendarWidget QSpinBox { background:#1a1d2e; color:#ccccdd; }"
+            "QCalendarWidget QAbstractItemView { background:#0f1018; color:#ccccdd;"
+            "  selection-background-color:#2a3055; selection-color:#ffffff; }"
+        )
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel("Select the date to report on:"))
+        cal = QCalendarWidget()
+        lay.addWidget(cal)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        gen_btn = QPushButton("Generate")
+        gen_btn.setStyleSheet(
+            "QPushButton { background:#0a2a0a; border:1px solid #44dd88;"
+            " color:#44dd88; padding:5px 16px; border-radius:3px; }"
+            "QPushButton:hover { background:#0e3812; }"
+        )
+        gen_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(gen_btn)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dlg.reject)
+        btn_row.addWidget(cancel_btn)
+        lay.addLayout(btn_row)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        date_str = cal.selectedDate().toString("yyyy-MM-dd")
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Daily Report",
+            f"Daily_Report_{date_str}.xlsx",
+            "Excel Workbook (*.xlsx);;All files (*)")
+        if not path:
+            return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+
+        from ui.export_xlsx import export_daily_report
+        try:
+            count = export_daily_report(self.db_path, path, date_str)
+        except Exception as exc:
+            import traceback
+            QMessageBox.critical(self, "Report Failed",
+                f"Could not generate report:\n{exc}\n\n{traceback.format_exc()}")
+            return
+
+        if count == 0:
+            QMessageBox.information(self, "Daily Report",
+                f"No files were created on {date_str}.")
+        else:
+            QMessageBox.information(self, "Daily Report",
+                f"Report saved to:\n{path}\n\n"
+                f"{count:,} file(s) created on {date_str}.")
+
     def _audit_open_editor(self, file_path: str, line_no: int):
         """Open a file in the editor tab and scroll to a line number."""
         # Find the record in the DB to get o_number etc.
@@ -1922,7 +2030,8 @@ class DirectMainWindow(QMainWindow):
 
         from ui.export_xlsx import export_workbook
         try:
-            used, free = export_workbook(self.db_path, path)
+            used, free = export_workbook(self.db_path, path,
+                                         scan_folders=self.scan_folders or None)
         except Exception as exc:
             import traceback
             QMessageBox.critical(self, "Export Failed",

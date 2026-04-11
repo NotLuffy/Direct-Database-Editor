@@ -40,10 +40,10 @@ _ITEM_FONT.setPointSize(10)
 
 _COUNT_COLOR = QColor("#555577")
 _SCORE_COLORS = {
-    "6":   QColor("#44dd88"),
-    "4-5": QColor("#aadd44"),
-    "2-3": QColor("#ffaa33"),
-    "0-1": QColor("#ff5555"),
+    "7":   QColor("#44dd88"),
+    "5-6": QColor("#aadd44"),
+    "3-4": QColor("#ffaa33"),
+    "0-2": QColor("#ff5555"),
 }
 
 
@@ -86,7 +86,7 @@ class DirectSidebar(QTreeWidget):
     key values:
         "all" | "active" | "flagged" | "review" | "delete" | "shop_special" | "missing"
         "dup_all" | "dup_exact" | "dup_conflict" | "dup_chain" | "dup_derived" | "dup_title"
-        "score_6" | "score_45" | "score_23" | "score_01"
+        "score_7" | "score_56" | "score_34" | "score_02"
         "verify_pass" | "verify_fail" | "verify_none"
         "attn_mismatch" | "attn_no_gcode" | "attn_shop_special"
         "recent_7d"
@@ -168,10 +168,10 @@ class DirectSidebar(QTreeWidget):
         sec_score = _section("  BY SCORE")
         self.addTopLevelItem(sec_score)
         for key, label, color in [
-            ("score_6",  "Score 6  Perfect", "6"),
-            ("score_45", "Score 4–5",        "4-5"),
-            ("score_23", "Score 2–3",        "2-3"),
-            ("score_01", "Score 0–1",        "0-1"),
+            ("score_7",  "Score 7  Perfect", "7"),
+            ("score_56", "Score 5–6",        "5-6"),
+            ("score_34", "Score 3–4",        "3-4"),
+            ("score_02", "Score 0–2",        "0-2"),
         ]:
             item = _leaf(label, key)
             item.setForeground(0, _SCORE_COLORS[color])
@@ -226,10 +226,10 @@ class DirectSidebar(QTreeWidget):
                 "dup_chain":        "Backup Chains",
                 "dup_derived":      "Derived Copies",
                 "dup_title":        "Title Matches",
-                "score_6":          "Score 6  Perfect",
-                "score_45":         "Score 4–5",
-                "score_23":         "Score 2–3",
-                "score_01":         "Score 0–1",
+                "score_7":          "Score 7  Perfect",
+                "score_56":         "Score 5–6",
+                "score_34":         "Score 3–4",
+                "score_02":         "Score 0–2",
                 "verify_pass":      "All Pass",
                 "verify_fail":      "Has Failures",
                 "verify_none":      "Not Verified",
@@ -261,10 +261,10 @@ class DirectSidebar(QTreeWidget):
         _set("dup_derived",  dup_counts.get("derived", 0))
         _set("dup_title",    dup_counts.get("title_match", 0))
 
-        _set("score_6",  score_counts.get("6", 0))
-        _set("score_45", score_counts.get("4-5", 0))
-        _set("score_23", score_counts.get("2-3", 0))
-        _set("score_01", score_counts.get("0-1", 0))
+        _set("score_7",  score_counts.get("7", 0))
+        _set("score_56", score_counts.get("5-6", 0))
+        _set("score_34", score_counts.get("3-4", 0))
+        _set("score_02", score_counts.get("0-2", 0))
 
         vc = verify_counts or {}
         _set("verify_pass", vc.get("all_pass", 0))

@@ -266,7 +266,11 @@ class FilterBar(QWidget):
                         continue
                 else:
                     try:
-                        target_thou = int(hc_text.split('"')[0].strip().replace('15MM (0.591)', '591'))
+                        raw = hc_text.split('"')[0].strip()
+                        if '15MM' in raw:
+                            target_thou = 591
+                        else:
+                            target_thou = round(float(raw) * 1000)
                         if hc_in is None or abs(_hc_key(hc_in) - target_thou) > 3:
                             continue
                     except (ValueError, TypeError):

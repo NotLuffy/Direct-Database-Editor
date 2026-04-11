@@ -334,7 +334,7 @@ class NewFileCreatorDialog(QDialog):
         color = "#ff6666" if has_fail else "#44dd88"
         self._verify_lbl.setStyleSheet(f"color:{color}; font-size:11px;")
         self._verify_lbl.setText(
-            f"Score: {score}/6    {vstatus or '(no status)'}")
+            f"Score: {score}/7    {vstatus or '(no status)'}")
         self._verified = True
         self._save_btn.setEnabled(True)
 
@@ -445,6 +445,6 @@ class NewFileCreatorDialog(QDialog):
         self.file_created.emit(file_path)
         QMessageBox.information(
             self, "File Created",
-            f"{onum} saved to:\n{file_path}\n\nScore: {score}/6"
+            f"{onum} saved to:\n{file_path}\n\nScore: {score}/7"
         )
         self.accept()

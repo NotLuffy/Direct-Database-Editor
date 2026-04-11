@@ -20,8 +20,8 @@ from PyQt6.QtGui import QColor, QFont
 import direct_database as db
 
 _SCORE_COLORS = {
-    6: "#44dd88", 5: "#aadd44", 4: "#aadd44",
-    3: "#ffaa33", 2: "#ffaa33", 1: "#ff5555", 0: "#ff5555",
+    7: "#44dd88", 6: "#aadd44", 5: "#aadd44",
+    4: "#ffaa33", 3: "#ffaa33", 2: "#ff5555", 1: "#ff5555", 0: "#ff5555",
 }
 _TYPE_LABELS = {
     "exact":         "Exact Copies (same content)",
@@ -68,7 +68,7 @@ class _MemberCard(QFrame):
         hdr.addStretch()
 
         score = rec.get("verify_score", 0)
-        score_lbl = QLabel(f"Score: {score}/6")
+        score_lbl = QLabel(f"Score: {score}/7")
         color = _SCORE_COLORS.get(score, "#888888")
         score_lbl.setStyleSheet(
             f"color:{color}; font-weight:bold; font-size:12px; "

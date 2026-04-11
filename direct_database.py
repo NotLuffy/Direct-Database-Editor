@@ -488,7 +488,7 @@ def get_status_counts(db_path: str, scope_folders: list | None = None) -> dict:
 
 
 def get_score_counts(db_path: str, scope_folders: list | None = None) -> dict:
-    """Return counts bucketed: perfect(6), good(4-5), fair(2-3), poor(0-1)."""
+    """Return counts bucketed: perfect(7), good(5-6), fair(3-4), poor(0-2)."""
     scope_sql, scope_params = _scope_clause(scope_folders)
     where = f"WHERE {scope_sql}" if scope_sql else ""
 
@@ -498,13 +498,13 @@ def get_score_counts(db_path: str, scope_folders: list | None = None) -> dict:
         scope_params
     ).fetchall()
     conn.close()
-    buckets = {"6": 0, "4-5": 0, "2-3": 0, "0-1": 0}
+    buckets = {"7": 0, "5-6": 0, "3-4": 0, "0-2": 0}
     for r in rows:
         s = r["verify_score"]
-        if s == 6:            buckets["6"]   += r["n"]
-        elif s in (4, 5):     buckets["4-5"] += r["n"]
-        elif s in (2, 3):     buckets["2-3"] += r["n"]
-        else:                 buckets["0-1"] += r["n"]
+        if s == 7:            buckets["7"]   += r["n"]
+        elif s in (5, 6):     buckets["5-6"] += r["n"]
+        elif s in (3, 4):     buckets["3-4"] += r["n"]
+        else:                 buckets["0-2"] += r["n"]
     return buckets
 
 

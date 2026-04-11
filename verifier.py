@@ -183,6 +183,7 @@ _AFTER_BRACKET_THICK_RE = re.compile(r'\]\s+(\d*\.?\d+)', re.IGNORECASE)
 # (?<![A-Z]) prevents matching inside words (e.g. "OFFSET") but allows after G01
 _F_RE         = re.compile(r'(?<![A-Z])F(\d*\.?\d+)', re.IGNORECASE)
 _F_MAX        = 0.02   # maximum allowed feed rate (inches/rev)
+_CB_F_MAX     = 0.015  # CB finish feed rate for HC 15MM+ parts
 
 # Integer coordinate check: X or Z value with NO decimal point (e.g. X3, Z-1).
 # Z0 is exempt — common retract value.  All other integer X/Z are flagged.
@@ -252,6 +253,167 @@ _G5X_RE  = re.compile(r'\bG5[45](?!\d)', re.IGNORECASE)
 _HOME_G53_RE = re.compile(
     r'\bG53(?!\d)[^;\n(]*Z(-\d+(?:\.\d+)?)',
     re.IGNORECASE)
+
+
+# ---------------------------------------------------------------------------
+# Turning Z-depth limit table: disc thickness (in) → max Z per side (negative)
+# ---------------------------------------------------------------------------
+_TURNING_Z_TABLE = {
+    # MM disc thicknesses (actual inch conversions for precise lookup)
+    round(10  / 25.4, 4):  -0.10,   # 10MM = 0.3937"
+    round(12  / 25.4, 4):  -0.10,   # 12MM = 0.4724"
+    round(13  / 25.4, 4):  -0.10,   # 13MM = 0.5118"
+    0.50:                  -0.10,   # 0.50" (covers 12/13/15MM group)
+    round(15  / 25.4, 4):  -0.10,   # 15MM = 0.5906"
+    # MM disc + 0.50" HC total thicknesses (explicit entries for HC+MM combos)
+    round(10  / 25.4 + 0.50, 4):  -0.55,  # 10MM+HC total ≈ 0.8937" → limit -0.55"
+    round(12  / 25.4 + 0.50, 4):  -0.55,  # 12MM+HC total ≈ 0.9724" → limit -0.55"
+    round(13  / 25.4 + 0.50, 4):  -0.55,  # 13MM+HC total ≈ 1.0118" → limit -0.55"
+    round(15  / 25.4 + 0.50, 4):  -0.60,  # 15MM+HC total ≈ 1.0906" → limit -0.60"
+    round(17  / 25.4 + 0.50, 4):  -0.70,  # 17MM+HC total ≈ 1.1693" → limit -0.70"
+    round(20  / 25.4 + 0.50, 4):  -0.70,  # 20MM+HC total ≈ 1.2874" → limit -0.70"
+    round(22  / 25.4 + 0.50, 4):  -0.70,  # 22MM+HC total ≈ 1.3661" → limit -0.70"
+    round(17  / 25.4, 4):  -0.35,   # 17MM = 0.6693"
+    0.75:                  -0.35,   # 0.75" (covers 17/20/22MM group)
+    round(20  / 25.4, 4):  -0.35,   # 20MM = 0.7874"
+    round(22  / 25.4, 4):  -0.35,   # 22MM = 0.8661"
+    1.00:   -0.55,
+    1.25:   -0.66,
+    1.50:   -0.80,
+    1.75:   -0.925,
+    2.00:   -1.05,
+    2.25:   -1.18,
+    2.50:   -1.30,
+    2.75:   -1.425,
+    3.00:   -1.60,
+    3.25:   -1.70,
+    3.50:   -1.81,
+    3.75:   -1.925,
+    4.00:   -2.05,
+}
+TZ_TOLERANCE = 0.03   # ±0.03" tolerance on turning Z-depth limit
+
+# For the settings UI: store original hardcoded values
+_DEFAULTS = {
+    "TOLERANCE_IN": TOLERANCE_IN,
+    "DR_TOLERANCE_IN": DR_TOLERANCE_IN,
+    "OD_TOLERANCE_IN": OD_TOLERANCE_IN,
+    "TZ_TOLERANCE": TZ_TOLERANCE,
+    "_F_MAX": 0.02,
+    "_CB_F_MAX": 0.015,
+}
+# Also store original _OD_TABLE and _TURNING_Z_TABLE by creating a snapshot
+_DEFAULTS["_OD_TABLE"] = dict(_OD_TABLE) if '_OD_TABLE' in dir() else {}
+_DEFAULTS["_TURNING_Z_TABLE"] = dict(_TURNING_Z_TABLE)
+
+
+def apply_overrides(overrides: dict):
+    """Apply user-configured overrides to verification limits.
+
+    Patches module-level constants and tables with values from a dict.
+    Missing keys fall back to hardcoded defaults.
+
+    Args:
+        overrides: Dict with keys like "TOLERANCE_IN", "TZ_0.3937", "OD_5.75"
+    """
+    global TOLERANCE_IN, DR_TOLERANCE_IN, OD_TOLERANCE_IN, TZ_TOLERANCE, _F_MAX, _CB_F_MAX
+    global _TURNING_Z_TABLE, _OD_TABLE
+
+    if not overrides:
+        return
+
+    # Simple scalar overrides
+    if "TOLERANCE_IN"    in overrides: TOLERANCE_IN    = float(overrides["TOLERANCE_IN"])
+    if "DR_TOLERANCE_IN" in overrides: DR_TOLERANCE_IN = float(overrides["DR_TOLERANCE_IN"])
+    if "OD_TOLERANCE_IN" in overrides: OD_TOLERANCE_IN = float(overrides["OD_TOLERANCE_IN"])
+    if "TZ_TOLERANCE"    in overrides: TZ_TOLERANCE    = float(overrides["TZ_TOLERANCE"])
+    if "_F_MAX"          in overrides: _F_MAX          = float(overrides["_F_MAX"])
+    if "_CB_F_MAX"       in overrides: _CB_F_MAX       = float(overrides["_CB_F_MAX"])
+
+    # _TURNING_Z_TABLE: keys like "TZ_0.3937" → thickness as key
+    for k, v in overrides.items():
+        if k.startswith("TZ_"):
+            try:
+                thickness = float(k[3:])
+                _TURNING_Z_TABLE[thickness] = float(v)
+            except (ValueError, KeyError):
+                pass
+
+    # _OD_TABLE: keys like "OD_5.75" → round size as key
+    for k, v in overrides.items():
+        if k.startswith("OD_"):
+            try:
+                rs = float(k[3:])
+                _OD_TABLE[rs] = float(v)
+            except (ValueError, KeyError):
+                pass
+
+
+def _turning_z_limit(disc_thickness_in: float) -> float | None:
+    """Return the max turning Z-depth (negative) for a disc thickness.
+    Looks up the nearest entry in _TURNING_Z_TABLE.
+    Returns None if thickness is outside the table range."""
+    if disc_thickness_in is None or disc_thickness_in < 0.10:
+        return None
+    # Find nearest thickness key
+    best_key = None
+    best_dist = 999.0
+    for key in _TURNING_Z_TABLE:
+        dist = abs(key - disc_thickness_in)
+        if dist < best_dist:
+            best_dist = dist
+            best_key = key
+    # Only match if within 0.15" of a table entry
+    if best_key is not None and best_dist <= 0.15:
+        return _TURNING_Z_TABLE[best_key]
+    # Interpolate for values between entries (linear)
+    keys = sorted(_TURNING_Z_TABLE.keys())
+    if disc_thickness_in < keys[0] or disc_thickness_in > keys[-1]:
+        return None
+    for j in range(len(keys) - 1):
+        if keys[j] <= disc_thickness_in <= keys[j + 1]:
+            frac = (disc_thickness_in - keys[j]) / (keys[j + 1] - keys[j])
+            z_lo = _TURNING_Z_TABLE[keys[j]]
+            z_hi = _TURNING_Z_TABLE[keys[j + 1]]
+            return round(z_lo + frac * (z_hi - z_lo), 4)
+    return None
+
+
+def _find_turning_z(block_lines: list, line_offset: int = 0) -> tuple:
+    """Find the deepest G01 Z in a T303 block (turning Z-depth).
+
+    Scans the T303 tool block for feed-rate moves (G01/G02/G03) and returns
+    the deepest (most negative) Z value found.
+
+    Returns (absolute_line_idx, deepest_z_value) or (None, None).
+    """
+    in_t303 = False
+    deepest_z = None
+    deepest_hit = None
+    for i, ln in enumerate(block_lines):
+        s = ln.strip()
+        if not s or s.startswith("(") or s == "%":
+            continue
+        if _T303_RE.search(s):
+            in_t303 = True
+            continue
+        if not in_t303:
+            continue
+        if _TOOL_CHG_RE.search(s) and not _T303_RE.search(s):
+            break   # left T303 block
+        if _G53_RE.search(s):
+            continue  # G53 machine-coord moves exempt
+        if _G00_LINE_RE.search(s):
+            continue  # rapids don't count
+        # Only G01/G02/G03 feed moves
+        if _FEED_RE.search(s):
+            zm = _Z_RE.search(s)
+            if zm:
+                z_val = float(zm.group(1))
+                if z_val < -0.01 and (deepest_z is None or z_val < deepest_z):
+                    deepest_z = z_val
+                    deepest_hit = line_offset + i
+    return deepest_hit, deepest_z
 
 
 def _home_z_for_thickness(t: float) -> int | None:
@@ -1557,6 +1719,52 @@ def verify_file(path: str, title: str, o_number: str = None) -> dict:
     _od_found_fail = od_op1_ok is False or od_op2_ok is False
     od_ok = (not _od_found_fail) if _od_found_any else None
 
+    # --- Turning Z-depth limit (TZ check) ---
+    # Scan T303 blocks for the deepest feed-move Z on each side (OP1 and OP2).
+    tz_op1_hit, tz_op1_z = _find_turning_z(pre_flip)
+    tz_op2_hit, tz_op2_z = (
+        _find_turning_z(post_flip, flip_idx + 1)
+        if flip_idx is not None else (None, None)
+    )
+    tz_ok      = None
+    tz_limit   = None
+    tz_op1_ok  = None
+    tz_op2_ok  = None
+    tz_note    = None
+    # Use total thickness (disc + hub) for the limit — HC parts need deeper cuts
+    _tz_thickness = total_thickness if total_thickness else disc_thickness
+    if _tz_thickness is not None:
+        tz_limit = _turning_z_limit(_tz_thickness)
+    if tz_limit is not None:
+        _tz_any_found = tz_op1_z is not None or tz_op2_z is not None
+        if _tz_any_found:
+            # Check each side against table limit
+            if tz_op1_z is not None:
+                tz_op1_ok = tz_op1_z >= tz_limit - TZ_TOLERANCE
+            if tz_op2_z is not None:
+                tz_op2_ok = tz_op2_z >= tz_limit - TZ_TOLERANCE
+            # 0.75× rule: neither side deeper than 75% of total thickness (under 4")
+            _tz_notes = []
+            if total_thickness and total_thickness < 4.0:
+                _tz_75_limit = -(0.75 * total_thickness)
+                if tz_op1_z is not None and tz_op1_z < _tz_75_limit - TZ_TOLERANCE:
+                    tz_op1_ok = False
+                    _tz_notes.append(f"OP1 Z{tz_op1_z:.4f} exceeds 75% of total ({_tz_75_limit:.4f})")
+                if tz_op2_z is not None and tz_op2_z < _tz_75_limit - TZ_TOLERANCE:
+                    tz_op2_ok = False
+                    _tz_notes.append(f"OP2 Z{tz_op2_z:.4f} exceeds 75% of total ({_tz_75_limit:.4f})")
+            # Hard cap: no side deeper than -4.15"
+            if tz_op1_z is not None and tz_op1_z < -4.15:
+                tz_op1_ok = False
+                _tz_notes.append(f"OP1 Z{tz_op1_z:.4f} exceeds hard cap Z-4.15")
+            if tz_op2_z is not None and tz_op2_z < -4.15:
+                tz_op2_ok = False
+                _tz_notes.append(f"OP2 Z{tz_op2_z:.4f} exceeds hard cap Z-4.15")
+            tz_note = "  ".join(_tz_notes) if _tz_notes else None
+            # Overall result
+            _tz_fail = tz_op1_ok is False or tz_op2_ok is False
+            tz_ok = not _tz_fail
+
     # --- P-code verification (lathe determined by round size, thickness = total) ---
     pcode_ok       = None
     pcode_lathe    = None
@@ -1633,6 +1841,29 @@ def verify_file(path: str, title: str, o_number: str = None) -> dict:
             if fval > _F_MAX + 1e-9:
                 fr_violations.append((i, fval))
     fr_ok = len(fr_violations) == 0 if fr_max_found > 0 else None  # None = no F found
+
+    # --- CB finish feed rate check ---
+    # For HC parts 15MM or larger, the CB line must use F0.015 (not F0.02).
+    cb_f_ok = None
+    cb_f_found = None
+    cb_f_expected = None
+    if cb_hit_line is not None and hc_height_in is not None:
+        # 15MM = 0.5906" hub height; check if HC height >= 15MM
+        if hc_height_in >= round(15.0 / 25.4, 4) - 0.001:
+            cb_f_expected = _CB_F_MAX
+            cb_line_text = lines[cb_hit_line].strip()
+            fm = _F_RE.search(cb_line_text)
+            if fm:
+                cb_f_found = float(fm.group(1))
+                cb_f_ok = cb_f_found <= _CB_F_MAX + 1e-9
+            else:
+                # No F on the CB line — check modal F from preceding lines
+                for back_i in range(cb_hit_line - 1, max(cb_hit_line - 20, -1), -1):
+                    back_fm = _F_RE.search(lines[back_i].strip())
+                    if back_fm:
+                        cb_f_found = float(back_fm.group(1))
+                        cb_f_ok = cb_f_found <= _CB_F_MAX + 1e-9
+                        break
 
     # --- Z depth limit: no non-G53 line should have Z < -4.15 ---
     _Z_DEEP_LIMIT = -4.15
@@ -1733,11 +1964,28 @@ def verify_file(path: str, title: str, o_number: str = None) -> dict:
         "od_op1_context_hit_ln":  od_op1_hit + 1 if od_op1_hit is not None else None,
         "od_op2_context":         context(od_op2_hit),
         "od_op2_context_hit_ln":  od_op2_hit + 1 if od_op2_hit is not None else None,
+        # Turning Z-depth (TZ)
+        "tz_ok":                  tz_ok,
+        "tz_limit":               tz_limit,
+        "tz_op1_z":               tz_op1_z,
+        "tz_op2_z":               tz_op2_z,
+        "tz_op1_ok":              tz_op1_ok,
+        "tz_op2_ok":              tz_op2_ok,
+        "tz_note":                tz_note,
+        "tz_context":             context(tz_op1_hit if tz_op1_ok is False else tz_op2_hit),
+        "tz_context_hit_ln":      (tz_op1_hit + 1 if tz_op1_hit is not None else None)
+                                  if tz_op1_ok is False
+                                  else (tz_op2_hit + 1 if tz_op2_hit is not None else None),
         # Feed rate
         "fr_ok":               fr_ok,
         "fr_max":              fr_max_found,
         "fr_violations":       fr_violations,
         "fr_context":          context(fr_violations[0][0]) if fr_violations else [],
+        # CB finish feed rate (HC 15MM+: must be F0.015 or less)
+        "cb_f_ok":             cb_f_ok,
+        "cb_f_found":          cb_f_found,
+        "cb_f_expected":       cb_f_expected,
+        "cb_f_context":        context(cb_hit_line) if cb_f_ok is False else [],
         # Z depth limit (non-G53 lines must not exceed Z-4.15)
         "z_deep_ok":           len(z_deep_violations) == 0,
         "z_deep_violations":   z_deep_violations,

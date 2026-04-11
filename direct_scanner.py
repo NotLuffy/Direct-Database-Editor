@@ -341,10 +341,10 @@ def _run_dedup_passes(records_by_path: dict, db_path: str,
             if m["file_path"] == rec_keep["file_path"]:
                 tag = (f"[DUP:exact] {len(members)-1} identical "
                        f"cop{'ies' if len(members)>2 else 'y'} found. "
-                       f"This file is the recommended keep (score {rec_score}/6).")
+                       f"This file is the recommended keep (score {rec_score}/7).")
             else:
                 tag = (f"[DUP:exact] Same content as {rec_name} "
-                       f"(score {rec_score}/6). Recommended keep: {rec_keep['file_path']}")
+                       f"(score {rec_score}/7). Recommended keep: {rec_keep['file_path']}")
             _append_dup_note(m, tag)
             db_conn.execute(
                 "UPDATE files SET notes=?, has_dup_flag=1 WHERE file_path=?",
@@ -378,12 +378,12 @@ def _run_dedup_passes(records_by_path: dict, db_path: str,
             if m["file_path"] == rec_keep["file_path"]:
                 tag = (f"[DUP:conflict] {len(members)-1} file(s) share O-number {onum} "
                        f"with different content. This is the recommended keep "
-                       f"(score {rec_keep['verify_score']}/6).")
+                       f"(score {rec_keep['verify_score']}/7).")
             else:
                 tag = (f"[DUP:conflict] Same O-number {onum}, different content. "
-                       f"Score: {m['verify_score']}/6. "
+                       f"Score: {m['verify_score']}/7. "
                        f"Recommended keep: {rec_keep['file_path']} "
-                       f"(score {rec_keep['verify_score']}/6).")
+                       f"(score {rec_keep['verify_score']}/7).")
             _append_dup_note(m, tag)
             db_conn.execute(
                 "UPDATE files SET notes=?, has_dup_flag=1 WHERE file_path=?",
@@ -419,13 +419,13 @@ def _run_dedup_passes(records_by_path: dict, db_path: str,
             if m["file_path"] == rec_keep["file_path"]:
                 tag = (f"[DUP:backup_chain] Backup chain for {onum}. "
                        f"{len(members)} files total. "
-                       f"This is the recommended keep (score {m['verify_score']}/6).")
+                       f"This is the recommended keep (score {m['verify_score']}/7).")
             else:
                 tag = (f"[DUP:backup_chain] Backup chain for {onum}. "
                        f"{len(members)} files total. "
                        f"Recommended keep: {rec_keep['file_path']} "
-                       f"(score {rec_keep['verify_score']}/6). "
-                       f"Your score: {m['verify_score']}/6.")
+                       f"(score {rec_keep['verify_score']}/7). "
+                       f"Your score: {m['verify_score']}/7.")
             _append_dup_note(m, tag)
             db_conn.execute(
                 "UPDATE files SET notes=?, has_dup_flag=1 WHERE file_path=?",
@@ -455,8 +455,8 @@ def _run_dedup_passes(records_by_path: dict, db_path: str,
             continue
         tag = (f"[DUP:derived] Derived from {derived}. "
                f"Original: {orig['file_path']} "
-               f"(score {orig['verify_score']}/6). "
-               f"This file score: {r['verify_score']}/6.")
+               f"(score {orig['verify_score']}/7). "
+               f"This file score: {r['verify_score']}/7.")
         _append_dup_note(r, tag)
         db_conn.execute(
             "UPDATE files SET notes=?, has_dup_flag=1 WHERE file_path=?",
@@ -494,8 +494,8 @@ def _run_dedup_passes(records_by_path: dict, db_path: str,
             if m["file_path"] != rec_keep["file_path"]:
                 tag = (f"[DUP:title_match] Same program title as {rec_keep['o_number']} "
                        f"({rec_keep['file_path']}). "
-                       f"Scores: this={m['verify_score']}/6, "
-                       f"other={rec_keep['verify_score']}/6.")
+                       f"Scores: this={m['verify_score']}/7, "
+                       f"other={rec_keep['verify_score']}/7.")
                 _append_dup_note(m, tag)
                 db_conn.execute(
                     "UPDATE files SET notes=?, has_dup_flag=1 WHERE file_path=?",

@@ -106,13 +106,13 @@ def _o_int(o_str: str) -> int:
 
 def _score_label(score: int) -> tuple[str, str]:
     """Return (label, hex_color) for a verify score."""
-    if score >= 6:
-        return f"★ {score}/6", "#44dd88"
-    if score >= 4:
-        return f"★ {score}/6", "#aadd44"
-    if score >= 2:
-        return f"★ {score}/6", "#ffaa33"
-    return f"★ {score}/6", "#ff5555"
+    if score >= 7:
+        return f"★ {score}/7", "#44dd88"
+    if score >= 5:
+        return f"★ {score}/7", "#aadd44"
+    if score >= 3:
+        return f"★ {score}/7", "#ffaa33"
+    return f"★ {score}/7", "#ff5555"
 
 
 def _get_score(path: str, title: str, o_number: str) -> int:

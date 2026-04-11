@@ -223,7 +223,7 @@ class VerifyPanel(QWidget):
   .desc { color: #aaaacc; }
 </style>
 
-<h2>Scored Checks (6 total &mdash; each adds 1 to score when PASS)</h2>
+<h2>Scored Checks (7 total &mdash; each adds 1 to score when PASS)</h2>
 <table>
   <tr><th>Token</th><th>Name</th><th>What It Checks</th></tr>
   <tr>
@@ -246,6 +246,12 @@ class VerifyPanel(QWidget):
     round size &plusmn;0.015" (e.g. 5.75&quot; round &rarr; 5.700&quot; OD).</td>
   </tr>
   <tr>
+    <td class="tok">TZ</td><td>Turning Z-Depth</td>
+    <td class="desc">Deepest T303 feed-move Z on each side (OP1/OP2) must not exceed
+    the thickness-based limit. Neither side may exceed 75% of total thickness
+    (under 4&quot;) or the hard cap of Z-4.15&quot;.</td>
+  </tr>
+  <tr>
     <td class="tok">PC</td><td>P-Code</td>
     <td class="desc">G154 P## work-offset number matches the lookup table for the
     round size + total thickness (lathe 1 vs lathe 2/3).</td>
@@ -266,6 +272,10 @@ class VerifyPanel(QWidget):
   <tr><td class="nf">NF</td><td class="desc">Not Found &mdash; could not locate the G-code block (scores 0, not a penalty)</td></tr>
   <tr><td style="color:#ffaa33;font-weight:bold">LOOSE</td>
       <td class="desc">CB bore found but tolerance is wider than standard (hub bore variant)</td></tr>
+  <tr><td class="pass">PASS*</td>
+      <td class="desc">Overridden to PASS via right-click &rarr; Override Verify</td></tr>
+  <tr><td class="fail">FAIL*</td>
+      <td class="desc">Overridden to FAIL via right-click &rarr; Override Verify</td></tr>
 </table>
 
 <h2>2PC-Only Tokens (not scored)</h2>
@@ -343,6 +353,15 @@ class VerifyPanel(QWidget):
         cb_detail = f"Found: {_inch(cb_found)}  ({_mm(cb_found)})    Expected: {cb_exp_str}"
         if cb_diff is not None:
             cb_detail += f"    Diff: {cb_diff:+.4f}\""
+        # CB finish feed rate (HC 15MM+)
+        cb_f_ok = result.get("cb_f_ok")
+        if cb_f_ok is not None:
+            cb_f_found = result.get("cb_f_found")
+            cb_f_exp = result.get("cb_f_expected")
+            f_color = "#44dd88" if cb_f_ok else "#ff5555"
+            f_status = "OK" if cb_f_ok else "HIGH"
+            cb_detail += (f'    <span style="color:{f_color}">CB Feed: '
+                          f'F{cb_f_found:.3f} (max F{cb_f_exp:.3f}) [{f_status}]</span>')
         self._add_check_row("CB  (Center Bore)", cb_badge, cb_detail)
         self._add_context(result.get("cb_context") or [],
                           result.get("cb_context_hit_ln"))
@@ -404,6 +423,26 @@ class VerifyPanel(QWidget):
         od_ctx    = result.get("od_op1_context") or result.get("od_op2_context") or []
         od_hit_ln = result.get("od_op1_context_hit_ln") or result.get("od_op2_context_hit_ln")
         self._add_context(od_ctx, od_hit_ln)
+
+        # ── Turning Z-Depth (TZ) ──────────────────────────────────────────────
+        tz_ok  = result.get("tz_ok")
+        txt, fg, bg = _ok_to_badge(tz_ok)
+        tz_badge = _badge(txt, fg, bg)
+        tz_op1 = result.get("tz_op1_z")
+        tz_op2 = result.get("tz_op2_z")
+        tz_lim = result.get("tz_limit")
+        tz_parts = []
+        if tz_op1 is not None: tz_parts.append(f"OP1: Z{tz_op1:.4f}")
+        if tz_op2 is not None: tz_parts.append(f"OP2: Z{tz_op2:.4f}")
+        tz_detail = ("Found: " + "  ".join(tz_parts) if tz_parts else "Found: —")
+        if tz_lim is not None:
+            tz_detail += f"    Limit: Z{tz_lim:.4f}"
+        tz_note = result.get("tz_note")
+        if tz_note:
+            tz_detail += f"    ⚠ {tz_note}"
+        self._add_check_row("TZ  (Turning Z-Depth)", tz_badge, tz_detail)
+        self._add_context(result.get("tz_context") or [],
+                          result.get("tz_context_hit_ln"))
 
         # ── P-Code ────────────────────────────────────────────────────────────
         pc_ok  = result.get("pcode_ok")

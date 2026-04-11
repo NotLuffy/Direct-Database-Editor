@@ -9,16 +9,18 @@ import shutil
 import datetime
 
 from PyQt6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QGridLayout,
     QTableView, QHeaderView, QAbstractItemView, QLabel, QPushButton,
     QFileDialog, QMessageBox, QToolBar, QStatusBar, QMenu, QDialog,
     QFormLayout, QLineEdit, QDialogButtonBox, QInputDialog, QCheckBox,
-    QTabWidget, QProgressDialog, QCalendarWidget
+    QTabWidget, QProgressDialog, QCalendarWidget, QScrollArea,
+    QSpinBox, QDoubleSpinBox
 )
 from PyQt6.QtCore import Qt, QSortFilterProxyModel, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QAction, QColor
 
 import direct_database as db
+import verifier
 from direct_models import DirectFileTableModel, COLUMNS, COL_IDX, _PART_TYPE_FILTERS, VerifyStatusDelegate
 from direct_scanner import IndexWorker
 from ui.sidebar import DirectSidebar
@@ -555,6 +557,14 @@ class DirectMainWindow(QMainWindow):
         try:
             with open(self.config_path) as f:
                 cfg = json.load(f)
+            # Apply any verification limit overrides from config
+            overrides = cfg.get("verify_overrides", {})
+            if overrides:
+                try:
+                    import verifier
+                    verifier.apply_overrides(overrides)
+                except Exception:
+                    pass
             folders = cfg.get("scan_folders", [])
             db_path = cfg.get("db_path", "")
             if db_path and os.path.exists(db_path) and folders:
@@ -573,12 +583,24 @@ class DirectMainWindow(QMainWindow):
         try:
             hdr = self._table.horizontalHeader()
             hidden = [i for i in range(len(COLUMNS)) if hdr.isSectionHidden(i)]
+            # Preserve existing verify_overrides if present
+            verify_overrides = {}
+            if os.path.exists(self.config_path):
+                try:
+                    with open(self.config_path) as f:
+                        existing = json.load(f)
+                    verify_overrides = existing.get("verify_overrides", {})
+                except Exception:
+                    pass
             with open(self.config_path, "w") as f:
-                json.dump({
+                cfg = {
                     "scan_folders":  self.scan_folders,
                     "db_path":       self.db_path,
                     "hidden_columns": hidden,
-                }, f, indent=2)
+                }
+                if verify_overrides:
+                    cfg["verify_overrides"] = verify_overrides
+                json.dump(cfg, f, indent=2)
         except Exception:
             pass
 
@@ -998,18 +1020,18 @@ class DirectMainWindow(QMainWindow):
             group_type = key.replace("dup_", "")
             self._dup_panel.load_all_by_type(group_type)
             self._bottom_tabs.setCurrentWidget(self._dup_panel)
-        elif key == "score_6":
-            db_filters["score_min"] = 6
+        elif key == "score_7":
+            db_filters["score_min"] = 7
+            db_filters["score_max"] = 7
+        elif key == "score_56":
+            db_filters["score_min"] = 5
             db_filters["score_max"] = 6
-        elif key == "score_45":
-            db_filters["score_min"] = 4
-            db_filters["score_max"] = 5
-        elif key == "score_23":
-            db_filters["score_min"] = 2
-            db_filters["score_max"] = 3
-        elif key == "score_01":
+        elif key == "score_34":
+            db_filters["score_min"] = 3
+            db_filters["score_max"] = 4
+        elif key == "score_02":
             db_filters["score_min"] = 0
-            db_filters["score_max"] = 1
+            db_filters["score_max"] = 2
         elif key == "recent_7d":
             db_filters["recent_days"] = 7
         elif key in ("verify_pass", "verify_fail", "verify_none"):
@@ -1110,13 +1132,40 @@ class DirectMainWindow(QMainWindow):
             ("review",       "Review"),
             ("delete",       "Mark Delete"),
             ("shop_special", "Shop Special  (skip verify)"),
+            ("verified",     "Verified"),
         ]:
-            status_menu.addAction(label, lambda s=st: self._set_status_multi(recs, s))
+            if st == "verified":
+                status_menu.addSeparator()
+                status_menu.addAction(label,
+                    lambda: self._set_verified_multi(recs))
+            else:
+                status_menu.addAction(label, lambda s=st: self._set_status_multi(recs, s))
 
         menu.addSeparator()
         menu.addAction(
             f"Re-Verify {'File' if single else f'{len(recs)} Files'}",
             lambda: self._action_reverify_selected(recs))
+
+        # Override Verify sub-menu (single file only)
+        if single:
+            override_menu = menu.addMenu("Override Verify")
+            for token, label in [
+                ("CB", "CB (Center Bore)"),
+                ("OB", "OB (Outer Bore)"),
+                ("DR", "DR (Drill Depth)"),
+                ("OD", "OD (OD Turn)"),
+                ("TZ", "TZ (Turning Z-Depth)"),
+                ("PC", "PC (P-Code)"),
+                ("HM", "HM (Home Position)"),
+            ]:
+                sub = override_menu.addMenu(label)
+                sub.addAction("Override → PASS",
+                    lambda t=token: self._apply_verify_override(rec, t, "PASS"))
+                sub.addAction("Override → FAIL",
+                    lambda t=token: self._apply_verify_override(rec, t, "FAIL"))
+            override_menu.addSeparator()
+            override_menu.addAction("Clear All Overrides",
+                lambda: self._clear_verify_overrides(rec))
 
         if single:
             menu.addAction("Copy O-Number",   lambda: self._copy_onum(rec))
@@ -1188,7 +1237,8 @@ class DirectMainWindow(QMainWindow):
 
     def _action_reverify_selected(self, recs: list[dict]):
         """Re-run verification on the selected files and update the DB."""
-        from direct_scorer import score_file
+        from direct_scorer import (score_file, parse_overrides,
+                                   apply_overrides_to_status)
         updated = 0
         conn = db.get_connection(self.db_path)
         with conn:
@@ -1202,6 +1252,11 @@ class DirectMainWindow(QMainWindow):
                     score, vstatus = score_file(path, title, o_number=onum)
                 except Exception:
                     continue
+                # Re-apply any existing overrides
+                notes = rec.get("notes", "") or ""
+                overrides = parse_overrides(notes)
+                if overrides:
+                    score, vstatus = apply_overrides_to_status(vstatus, overrides)
                 conn.execute(
                     "UPDATE files SET verify_score=?, verify_status=? WHERE id=?",
                     (score, vstatus, rec["id"]))
@@ -1410,6 +1465,78 @@ class DirectMainWindow(QMainWindow):
     def _set_status_multi(self, recs: list[dict], status: str):
         for rec in recs:
             db.update_file_status(self.db_path, rec["id"], status)
+        self._refresh_all()
+
+    def _set_verified_multi(self, recs: list[dict]):
+        """Set status to 'verified' and stamp the G-code file with a VERIFIED comment."""
+        import datetime
+        now = datetime.datetime.now().strftime("%d/%m/%Y %H:%M")
+        for rec in recs:
+            path = rec.get("file_path", "")
+            # Write VERIFIED comment into G-code file
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    lines = fh.readlines()
+                # Find insertion point: after the first O-line (title line)
+                insert_idx = None
+                verified_idx = None
+                for i, ln in enumerate(lines):
+                    s = ln.strip()
+                    if not s or s == "%":
+                        continue
+                    # First code line (O-number line) — insert after it
+                    if insert_idx is None:
+                        insert_idx = i + 1
+                    # Check if VERIFIED line already exists
+                    if s.startswith("(VERIFIED") or s.startswith("( VERIFIED"):
+                        verified_idx = i
+                        break
+                verified_line = f"(VERIFIED {now})\n"
+                if verified_idx is not None:
+                    lines[verified_idx] = verified_line
+                elif insert_idx is not None:
+                    lines.insert(insert_idx, verified_line)
+                with open(path, "w", encoding="utf-8", newline="") as fh:
+                    fh.writelines(lines)
+            except Exception:
+                pass  # file write failure — still update DB status
+            db.update_file_status(self.db_path, rec["id"], "verified")
+        self._refresh_all()
+
+    def _apply_verify_override(self, rec: dict, check_token: str, value: str):
+        """Override a single verification check to PASS or FAIL."""
+        from direct_scorer import (set_override_in_notes, parse_overrides,
+                                   apply_overrides_to_status)
+        notes = rec.get("notes", "") or ""
+        new_notes = set_override_in_notes(notes, check_token, value)
+        # Apply overrides to existing verify_status
+        overrides = parse_overrides(new_notes)
+        vstatus = rec.get("verify_status", "") or ""
+        new_score, new_vstatus = apply_overrides_to_status(vstatus, overrides)
+        conn = db.get_connection(self.db_path)
+        with conn:
+            conn.execute(
+                "UPDATE files SET notes=?, verify_score=?, verify_status=? WHERE id=?",
+                (new_notes, new_score, new_vstatus, rec["id"]))
+        conn.close()
+        self._refresh_all()
+
+    def _clear_verify_overrides(self, rec: dict):
+        """Remove all overrides and re-verify the file from scratch."""
+        from direct_scorer import clear_overrides_in_notes, score_file
+        notes = rec.get("notes", "") or ""
+        new_notes = clear_overrides_in_notes(notes)
+        # Re-verify from scratch (no overrides)
+        path = rec.get("file_path", "")
+        title = rec.get("program_title", "")
+        onum = rec.get("o_number", "")
+        score, vstatus = score_file(path, title, o_number=onum)
+        conn = db.get_connection(self.db_path)
+        with conn:
+            conn.execute(
+                "UPDATE files SET notes=?, verify_score=?, verify_status=? WHERE id=?",
+                (new_notes, score, vstatus, rec["id"]))
+        conn.close()
         self._refresh_all()
 
     def _copy_onum(self, rec: dict):
@@ -2143,6 +2270,154 @@ class DirectMainWindow(QMainWindow):
     # Settings
     # ------------------------------------------------------------------
 
+    def _build_verify_limits_tab(self, parent_dialog: QDialog) -> tuple[QWidget, dict]:
+        """Build the Verify Limits settings tab.
+
+        Returns (tab_widget, control_dict) where control_dict maps setting keys
+        to their QSpinBox/QDoubleSpinBox/etc controls for later retrieval.
+        """
+        import verifier
+
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(12, 12, 12, 12)
+
+        scroll = QScrollArea()
+        scroll.setStyleSheet("QScrollArea{border:none;background:#0d0e18;}")
+        scroll_widget = QWidget()
+        scroll_layout = QGridLayout(scroll_widget)
+        scroll_layout.setColumnStretch(0, 0)
+        scroll_layout.setColumnStretch(1, 0)
+        scroll_layout.setColumnStretch(2, 1)
+        scroll_layout.setSpacing(8)
+
+        row = 0
+        controls = {}
+
+        # Section 1: Tolerances
+        title_label = QLabel("Tolerances")
+        title_label.setStyleSheet("font-weight:bold;color:#88ccff;")
+        scroll_layout.addWidget(title_label, row, 0, 1, 3)
+        row += 1
+
+        tolerance_fields = [
+            ("TOLERANCE_IN", "CB/OB Bore (in)", 0.0010),
+            ("DR_TOLERANCE_IN", "Drill Depth (in)", 0.0200),
+            ("OD_TOLERANCE_IN", "OD Turn (in)", 0.0150),
+            ("TZ_TOLERANCE", "Turning Z (in)", 0.0300),
+            ("_F_MAX", "Max Feed Rate (in/rev)", 0.0200),
+            ("_CB_F_MAX", "CB Finish Feed (HC 15MM+)", 0.0150),
+        ]
+
+        for key, label, orig_val in tolerance_fields:
+            label_w = QLabel(label)
+            orig_text = QLabel(f"Original: {orig_val:.4f}")
+            orig_text.setStyleSheet("color:#666688;")
+
+            spinbox = QDoubleSpinBox()
+            spinbox.setRange(0.0001, 1.0)
+            spinbox.setSingleStep(0.0001)
+            spinbox.setDecimals(4)
+            spinbox.setValue(getattr(verifier, key, orig_val))
+            spinbox.setStyleSheet("background:#1a1d2e;border:1px solid #2a2d45;color:#ccccdd;padding:2px;")
+
+            scroll_layout.addWidget(label_w, row, 0)
+            scroll_layout.addWidget(orig_text, row, 1)
+            scroll_layout.addWidget(spinbox, row, 2)
+            controls[key] = spinbox
+            row += 1
+
+        row += 1  # Spacing
+
+        # Section 2: Turning Z Table
+        title_label = QLabel("Turning Z Limits (by disc thickness)")
+        title_label.setStyleSheet("font-weight:bold;color:#88ccff;margin-top:8px;")
+        scroll_layout.addWidget(title_label, row, 0, 1, 3)
+        row += 1
+
+        tz_header_th = QLabel("Thickness (in)")
+        tz_header_th.setStyleSheet("font-weight:bold;color:#aaaacc;")
+        tz_header_orig = QLabel("Original limit")
+        tz_header_orig.setStyleSheet("font-weight:bold;color:#aaaacc;")
+        tz_header_curr = QLabel("Current limit")
+        tz_header_curr.setStyleSheet("font-weight:bold;color:#aaaacc;")
+        scroll_layout.addWidget(tz_header_th, row, 0)
+        scroll_layout.addWidget(tz_header_orig, row, 1)
+        scroll_layout.addWidget(tz_header_curr, row, 2)
+        row += 1
+
+        for thickness in sorted(verifier._DEFAULTS.get("_TURNING_Z_TABLE", {}).keys()):
+            orig_limit = verifier._DEFAULTS["_TURNING_Z_TABLE"][thickness]
+            curr_limit = verifier._TURNING_Z_TABLE.get(thickness, orig_limit)
+
+            th_label = QLabel(f"{thickness:.4f}\"")
+            orig_label = QLabel(f"{orig_limit:.2f}\"")
+            orig_label.setStyleSheet("color:#666688;")
+
+            limit_spin = QDoubleSpinBox()
+            limit_spin.setRange(-5.0, 0.0)
+            limit_spin.setSingleStep(0.05)
+            limit_spin.setDecimals(2)
+            limit_spin.setValue(curr_limit)
+            limit_spin.setStyleSheet("background:#1a1d2e;border:1px solid #2a2d45;color:#ccccdd;padding:2px;")
+
+            key = f"TZ_{thickness:.4f}"
+            controls[key] = limit_spin
+
+            scroll_layout.addWidget(th_label, row, 0)
+            scroll_layout.addWidget(orig_label, row, 1)
+            scroll_layout.addWidget(limit_spin, row, 2)
+            row += 1
+
+        row += 1  # Spacing
+
+        # Section 3: OD Table (just the key round sizes to avoid clutter)
+        title_label = QLabel("OD Turn Finish (by round size)")
+        title_label.setStyleSheet("font-weight:bold;color:#88ccff;margin-top:8px;")
+        scroll_layout.addWidget(title_label, row, 0, 1, 3)
+        row += 1
+
+        od_header_rs = QLabel("Round Size (in)")
+        od_header_rs.setStyleSheet("font-weight:bold;color:#aaaacc;")
+        od_header_orig = QLabel("Original OD")
+        od_header_orig.setStyleSheet("font-weight:bold;color:#aaaacc;")
+        od_header_curr = QLabel("Current OD")
+        od_header_curr.setStyleSheet("font-weight:bold;color:#aaaacc;")
+        scroll_layout.addWidget(od_header_rs, row, 0)
+        scroll_layout.addWidget(od_header_orig, row, 1)
+        scroll_layout.addWidget(od_header_curr, row, 2)
+        row += 1
+
+        for round_size in sorted(verifier._DEFAULTS.get("_OD_TABLE", {}).keys()):
+            orig_od = verifier._DEFAULTS["_OD_TABLE"][round_size]
+            curr_od = verifier._OD_TABLE.get(round_size, orig_od)
+
+            rs_label = QLabel(f"{round_size:.2f}\"")
+            orig_label = QLabel(f"{orig_od:.3f}\"")
+            orig_label.setStyleSheet("color:#666688;")
+
+            od_spin = QDoubleSpinBox()
+            od_spin.setRange(0.0, 20.0)
+            od_spin.setSingleStep(0.001)
+            od_spin.setDecimals(3)
+            od_spin.setValue(curr_od)
+            od_spin.setStyleSheet("background:#1a1d2e;border:1px solid #2a2d45;color:#ccccdd;padding:2px;")
+
+            key = f"OD_{round_size:.2f}"
+            controls[key] = od_spin
+
+            scroll_layout.addWidget(rs_label, row, 0)
+            scroll_layout.addWidget(orig_label, row, 1)
+            scroll_layout.addWidget(od_spin, row, 2)
+            row += 1
+
+        scroll_layout.setRowStretch(row, 1)
+        scroll.setWidget(scroll_widget)
+        scroll.setWidgetResizable(True)
+        layout.addWidget(scroll)
+
+        return tab, controls
+
     def _on_settings(self):
         if not self.db_path:
             QMessageBox.information(self, "Settings",
@@ -2151,7 +2426,8 @@ class DirectMainWindow(QMainWindow):
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Settings")
-        dlg.setMinimumWidth(420)
+        dlg.setMinimumWidth(620)
+        dlg.setMinimumHeight(500)
         dlg.setStyleSheet(
             "QDialog{background:#0d0e18;color:#ccccdd;}"
             "QLabel{color:#aaaacc;} "
@@ -2160,10 +2436,22 @@ class DirectMainWindow(QMainWindow):
             "QCheckBox{color:#aaaacc;}"
             "QPushButton{background:#1a2030;border:1px solid #2a2d45;"
             "color:#aaaacc;padding:4px 12px;border-radius:3px;}"
+            "QSpinBox,QDoubleSpinBox{background:#1a1d2e;border:1px solid #2a2d45;"
+            "color:#ccccdd;padding:2px;border-radius:3px;}"
+            "QTabWidget{border:none;} "
+            "QTabBar::tab{background:#1a1d2e;color:#aaaacc;padding:6px 16px;border:1px solid #2a2d45;}"
+            "QTabBar::tab:selected{background:#2a3050;color:#ccccdd;border-bottom:2px solid #5588ff;}"
         )
-        form = QFormLayout(dlg)
+
+        tabs = QTabWidget()
+        main_layout = QVBoxLayout(dlg)
+        main_layout.addWidget(tabs)
+
+        # --- Tab 1: General Settings ---
+        general_tab = QWidget()
+        form = QFormLayout(general_tab)
         form.setSpacing(10)
-        form.setContentsMargins(16, 16, 16, 12)
+        form.setContentsMargins(16, 16, 16, 16)
 
         settings = db.get_all_settings(self.db_path)
 
@@ -2197,21 +2485,104 @@ class DirectMainWindow(QMainWindow):
         allow_del.setChecked(settings.get("allow_delete", "1") == "1")
         form.addRow("Delete files:", allow_del)
 
+        tabs.addTab(general_tab, "General")
+
+        # --- Tab 2: Verify Limits ---
+        verify_tab, verify_controls = self._build_verify_limits_tab(dlg)
+        tabs.addTab(verify_tab, "Verify Limits")
+
+        # --- Dialog buttons ---
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save |
             QDialogButtonBox.StandardButton.Cancel)
         btns.accepted.connect(dlg.accept)
         btns.rejected.connect(dlg.reject)
-        form.addRow(btns)
+        main_layout.addWidget(btns)
 
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
+        # Save general settings
         db.set_setting(self.db_path, "auto_backup_on_edit", "1" if auto_bak.isChecked() else "0")
         db.set_setting(self.db_path, "backup_extension", bak_ext.text().strip() or ".bak")
         db.set_setting(self.db_path, "backup_folder", bak_folder_edit.text().strip())
         db.set_setting(self.db_path, "new_programs_folder", new_progs_edit.text().strip())
         db.set_setting(self.db_path, "allow_delete", "1" if allow_del.isChecked() else "0")
+
+        # Save verify limits (with confirmation)
+        self._save_verify_limits(verify_controls)
+
+    def _save_verify_limits(self, controls: dict):
+        """Save verification limit overrides with confirmation dialog.
+
+        Args:
+            controls: Dict mapping setting keys to their QSpinBox/QDoubleSpinBox controls.
+        """
+        import verifier
+
+        # Collect current values from controls and compare to defaults
+        changes = {}
+        change_list = []
+
+        for key, ctrl in controls.items():
+            curr_val = ctrl.value()
+
+            # Get the original default value
+            if key in verifier._DEFAULTS:
+                orig_val = verifier._DEFAULTS[key]
+            elif key.startswith("TZ_"):
+                thickness = float(key[3:])
+                orig_val = verifier._DEFAULTS.get("_TURNING_Z_TABLE", {}).get(thickness)
+            elif key.startswith("OD_"):
+                rs = float(key[3:])
+                orig_val = verifier._DEFAULTS.get("_OD_TABLE", {}).get(rs)
+            else:
+                orig_val = None
+
+            if orig_val is not None and curr_val != orig_val:
+                changes[key] = curr_val
+                change_list.append(f"  {key}: {orig_val:.4f} → {curr_val:.4f}")
+
+        if not changes:
+            # No changes, nothing to save
+            return
+
+        # Show confirmation dialog
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Confirm Verify Limits Changes")
+        msg.setIcon(QMessageBox.Icon.Information)
+        msg.setText("You are about to change the following verification limits:\n")
+        msg.setInformativeText("\n".join(change_list))
+        msg.setStandardButtons(QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
+        if msg.exec() != QMessageBox.StandardButton.Ok:
+            return
+
+        # Load existing config, update verify_overrides, and save
+        try:
+            existing_cfg = {}
+            if os.path.exists(self.config_path):
+                with open(self.config_path) as f:
+                    existing_cfg = json.load(f)
+        except Exception:
+            existing_cfg = {}
+
+        # Merge new changes into verify_overrides
+        verify_overrides = existing_cfg.get("verify_overrides", {})
+        verify_overrides.update(changes)
+        existing_cfg["verify_overrides"] = verify_overrides
+
+        # Save updated config
+        try:
+            with open(self.config_path, "w") as f:
+                json.dump(existing_cfg, f, indent=2)
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to save settings: {e}")
+            return
+
+        # Apply overrides immediately without restart
+        verifier.apply_overrides(verify_overrides)
+
+        QMessageBox.information(self, "Success", "Verification limits updated. Changes take effect immediately.")
 
     def _pick_backup_folder(self, edit: QLineEdit):
         folder = QFileDialog.getExistingDirectory(self, "Select Backup Folder", "",

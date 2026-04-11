@@ -19,7 +19,7 @@ import verifier as _verifier
 _PT = re.IGNORECASE
 
 _2PC_RE = re.compile(r'-*2\s*PC\b', _PT)
-_STL_RE = re.compile(r'\b(?:STEEL|STL)[\s._-]*RING\b|\bHCS-?\d*\b', _PT)
+_STL_RE = re.compile(r'\b(?:STEEL|STL)[\s._-]*RING\b|\bHCS-?\d*\b|\bSTEEL\s+S-\d+\b', _PT)
 
 
 def _has_hub(title: str) -> bool:
@@ -97,9 +97,9 @@ _STATUS_LABELS = {
 }
 
 def _score_color(score: int) -> QColor:
-    if score == 6:     return QColor("#44dd88")
-    if score >= 4:     return QColor("#aadd44")
-    if score >= 2:     return QColor("#ffaa33")
+    if score >= 7:     return QColor("#44dd88")
+    if score >= 5:     return QColor("#aadd44")
+    if score >= 3:     return QColor("#ffaa33")
     return QColor("#ff5555")
 
 
@@ -115,7 +115,7 @@ def _part_type(title: str) -> str:
         return "2PC"
     if re.search(r'\bSTEP\b', title, _PT):
         return "STEP"
-    if re.search(r'\b(?:STEEL|STL)[\s._-]*RING\b|\bHCS-\d+\b', title, _PT):
+    if re.search(r'\b(?:STEEL|STL)[\s._-]*RING\b|\bHCS-?\d*\b|\bSTEEL\s+S-\d+\b', title, _PT):
         return "STEEL"
     if re.search(r'\bSPACER\b', title, _PT):
         return "SPACER"
@@ -233,7 +233,7 @@ class DirectFileTableModel(QAbstractTableModel):
             if key == "status":
                 return _STATUS_LABELS.get(st, st.upper())
             if key == "verify_score":
-                return f"{val}/6" if val is not None else "—"
+                return f"{val}/7" if val is not None else "—"
             if key == "line_count":
                 return str(val) if val else "—"
             if key == "has_dup_flag":

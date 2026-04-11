@@ -13,15 +13,18 @@ import os
 import re
 import shutil
 import datetime
+import tempfile
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QPlainTextEdit, QMessageBox, QFileDialog, QSplitter, QFrame, QTextEdit
+    QPlainTextEdit, QMessageBox, QFileDialog, QSplitter, QFrame,
+    QTextEdit, QScrollArea, QSizePolicy
 )
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QFont, QColor, QSyntaxHighlighter, QTextCharFormat, QTextCursor
+from PyQt6.QtCore import Qt, pyqtSignal, QSize, QRect
+from PyQt6.QtGui import QFont, QColor, QSyntaxHighlighter, QTextCharFormat, QTextCursor, QPainter
 
 import direct_database as db
+import verifier as _vfy
 from direct_scorer import score_file, get_error_lines
 
 
@@ -55,17 +58,95 @@ class _GcodeHighlighter(QSyntaxHighlighter):
 
 
 # ---------------------------------------------------------------------------
+# Line-number gutter (painted outside the document — not selectable)
+# ---------------------------------------------------------------------------
+
+class _LineNumberArea(QWidget):
+    """Gutter widget that displays line numbers for a _CodeEditor."""
+
+    def __init__(self, editor: "_CodeEditor"):
+        super().__init__(editor)
+        self._editor = editor
+
+    def sizeHint(self) -> QSize:
+        return QSize(self._editor.line_number_area_width(), 0)
+
+    def paintEvent(self, event):
+        self._editor.line_number_area_paint(event)
+
+
+class _CodeEditor(QPlainTextEdit):
+    """QPlainTextEdit with a non-selectable line-number gutter."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._line_area = _LineNumberArea(self)
+        self.blockCountChanged.connect(self._update_line_area_width)
+        self.updateRequest.connect(self._update_line_area)
+        self._update_line_area_width()
+
+    def line_number_area_width(self) -> int:
+        digits = max(1, len(str(self.blockCount())))
+        return 10 + self.fontMetrics().horizontalAdvance("9") * digits
+
+    def _update_line_area_width(self, _count=0):
+        self.setViewportMargins(self.line_number_area_width(), 0, 0, 0)
+
+    def _update_line_area(self, rect, dy):
+        if dy:
+            self._line_area.scroll(0, dy)
+        else:
+            self._line_area.update(0, rect.y(),
+                                   self._line_area.width(), rect.height())
+        if rect.contains(self.viewport().rect()):
+            self._update_line_area_width()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        cr = self.contentsRect()
+        self._line_area.setGeometry(
+            QRect(cr.left(), cr.top(),
+                  self.line_number_area_width(), cr.height()))
+
+    def line_number_area_paint(self, event):
+        painter = QPainter(self._line_area)
+        painter.fillRect(event.rect(), QColor("#0a0b14"))
+
+        block = self.firstVisibleBlock()
+        block_num = block.blockNumber()
+        top = round(self.blockBoundingGeometry(block)
+                    .translated(self.contentOffset()).top())
+        bottom = top + round(self.blockBoundingRect(block).height())
+
+        painter.setFont(QFont("Consolas", 9))
+        while block.isValid() and top <= event.rect().bottom():
+            if block.isVisible() and bottom >= event.rect().top():
+                painter.setPen(QColor("#3a3d55"))
+                painter.drawText(
+                    0, top,
+                    self._line_area.width() - 4,
+                    self.fontMetrics().height(),
+                    Qt.AlignmentFlag.AlignRight, str(block_num + 1))
+            block = block.next()
+            top = bottom
+            bottom = top + round(self.blockBoundingRect(block).height())
+            block_num += 1
+
+        painter.end()
+
+
+# ---------------------------------------------------------------------------
 # Score badge widget
 # ---------------------------------------------------------------------------
 
 class _ScoreBadge(QLabel):
 
-    _COLORS = {6: "#44dd88", 5: "#aadd44", 4: "#aadd44",
-               3: "#ffaa33", 2: "#ffaa33", 1: "#ff5555", 0: "#ff5555"}
+    _COLORS = {7: "#44dd88", 6: "#aadd44", 5: "#aadd44",
+               4: "#ffaa33", 3: "#ffaa33", 2: "#ff5555", 1: "#ff5555", 0: "#ff5555"}
 
     def set_score(self, score: int, verify_status: str = ""):
         color = self._COLORS.get(score, "#888888")
-        self.setText(f"  Score: {score}/6  ")
+        self.setText(f"  Score: {score}/7  ")
         self.setStyleSheet(
             f"color:{color}; font-weight:bold; font-size:13px; "
             f"border:1px solid {color}55; border-radius:4px; padding:2px 6px;"
@@ -144,6 +225,18 @@ class EditorPanel(QWidget):
         self._verify_btn.setEnabled(False)
         hlay.addWidget(self._verify_btn)
 
+        self._save_verify_btn = QPushButton("Save + Verify")
+        self._save_verify_btn.setFixedWidth(100)
+        self._save_verify_btn.setStyleSheet(
+            "QPushButton{background:#1a2a3a;border:1px solid #2a4a6a;"
+            "color:#66aadd;padding:3px 10px;border-radius:3px;font-size:11px;}"
+            "QPushButton:hover{background:#1e3a50;}"
+            "QPushButton:disabled{color:#333355;border-color:#1a1d2e;background:#0f1018;}"
+        )
+        self._save_verify_btn.clicked.connect(self._on_save_and_verify)
+        self._save_verify_btn.setEnabled(False)
+        hlay.addWidget(self._save_verify_btn)
+
         self._save_btn = QPushButton("Save")
         self._save_btn.setFixedWidth(70)
         self._save_btn.setStyleSheet(
@@ -185,13 +278,56 @@ class EditorPanel(QWidget):
         self._tokens_lbl.setFixedHeight(20)
         root.addWidget(self._tokens_lbl)
 
-        # ── Editor ──
-        self._editor = QPlainTextEdit()
+        # ── Splitter: Editor (left) | Verify Results (right) ──
+        self._splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._splitter.setStyleSheet(
+            "QSplitter::handle{background:#1a1d2e; width:3px;}")
+
+        # Left: code editor (with line-number gutter)
+        self._editor = _CodeEditor()
         self._editor.setFont(QFont("Consolas", 10))
         self._editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self._highlighter = _GcodeHighlighter(self._editor.document())
         self._editor.document().modificationChanged.connect(self._on_dirty_changed)
-        root.addWidget(self._editor, stretch=1)
+        self._splitter.addWidget(self._editor)
+
+        # Right: verify results panel
+        self._verify_pane = QWidget()
+        self._verify_pane.setStyleSheet("background:#0d0e18;")
+        vp_layout = QVBoxLayout(self._verify_pane)
+        vp_layout.setContentsMargins(0, 0, 0, 0)
+        vp_layout.setSpacing(0)
+
+        vp_hdr = QLabel("  Verification Results")
+        vp_hdr.setStyleSheet(
+            "background:#0f1018; color:#88aacc; font-size:11px; "
+            "font-weight:bold; padding:4px 8px; border-bottom:1px solid #1a1d2e;")
+        vp_hdr.setFixedHeight(28)
+        vp_layout.addWidget(vp_hdr)
+
+        self._verify_scroll = QScrollArea()
+        self._verify_scroll.setWidgetResizable(True)
+        self._verify_scroll.setStyleSheet(
+            "QScrollArea{border:none; background:#0d0e18;}"
+            "QScrollBar:vertical{background:#0a0b14;width:8px;}"
+            "QScrollBar::handle:vertical{background:#2a2d45;border-radius:4px;}"
+        )
+        self._verify_content = QWidget()
+        self._verify_content_lay = QVBoxLayout(self._verify_content)
+        self._verify_content_lay.setContentsMargins(6, 6, 6, 6)
+        self._verify_content_lay.setSpacing(4)
+        self._verify_content_lay.addStretch()
+        self._verify_scroll.setWidget(self._verify_content)
+        vp_layout.addWidget(self._verify_scroll, stretch=1)
+
+        self._splitter.addWidget(self._verify_pane)
+
+        # Default sizes: 65% editor, 35% verify
+        self._splitter.setSizes([650, 350])
+        # Start with verify panel hidden until first verify
+        self._verify_pane.hide()
+
+        root.addWidget(self._splitter, stretch=1)
 
     # ------------------------------------------------------------------
     # Public API
@@ -233,10 +369,21 @@ class EditorPanel(QWidget):
         self._tokens_lbl.setText(verify_status or "  Not verified")
         self._verify_btn.setEnabled(True)
         self._save_btn.setEnabled(False)
+        self._save_verify_btn.setEnabled(False)
         self._discard_btn.setEnabled(False)
         self._revision_btn.setEnabled(True)
         self._dirty_lbl.setText("")
         self._apply_error_highlights()
+
+        # Auto-run verification and show side panel
+        try:
+            row = db.get_file_by_path(self.db_path, file_path) if self.db_path else None
+            title = row["program_title"] if row else ""
+            result = _vfy.verify_file(file_path, title,
+                                       o_number=o_number or None)
+            self._populate_verify_panel(result or {})
+        except Exception:
+            pass  # non-fatal — panel just stays empty
 
         if scroll_to_line > 0:
             block = self._editor.document().findBlockByLineNumber(scroll_to_line - 1)
@@ -255,38 +402,78 @@ class EditorPanel(QWidget):
     def _on_dirty_changed(self, modified: bool):
         self._dirty_lbl.setText("● unsaved" if modified else "")
         self._save_btn.setEnabled(modified and bool(self._file_path))
+        self._save_verify_btn.setEnabled(modified and bool(self._file_path))
         self._discard_btn.setEnabled(modified)
 
     def _on_verify(self):
+        """Verify the current editor text (writes to temp file if unsaved)."""
         if not self._file_path:
             return
-        # Save to a temp string and verify from current on-disk content
-        # (if dirty, inform user we're verifying saved version)
-        if self._editor.document().isModified():
-            QMessageBox.information(self, "Verify",
-                "Showing verification for the last saved version.\n"
-                "Save first to verify your current edits.")
-        row = db.get_file_by_path(self.db_path, self._file_path)
-        title = row["program_title"] if row else ""
-        score, vstatus = score_file(self._file_path, title, o_number=self._o_number)
+        result, score, vstatus = self._run_verify_on_editor_text()
         self._score_badge.set_score(score, vstatus)
         self._tokens_lbl.setText(vstatus or "  No result")
         self._apply_error_highlights()
+        self._populate_verify_panel(result)
+
+    def _on_save_and_verify(self):
+        """Save the file then immediately verify and show results."""
+        self._on_save()
+        if not self._editor.document().isModified():
+            # Save succeeded — run verify on saved file
+            self._on_verify()
+
+    def _run_verify_on_editor_text(self):
+        """Run verification on current editor content. Returns (result, score, vstatus)."""
+        row = db.get_file_by_path(self.db_path, self._file_path) if self.db_path else None
+        title = row["program_title"] if row else ""
+
+        if self._editor.document().isModified():
+            # Write editor text to a temp file for verification
+            content = self._editor.toPlainText()
+            # Re-extract title from the edited content
+            lines = content.split("\n")
+            for ln in lines[:5]:
+                m = re.match(r'^O\d{4,6}\s*\((.+?)\)', ln.strip(), re.IGNORECASE)
+                if m:
+                    title = m.group(1).strip()
+                    break
+            try:
+                fd, tmp = tempfile.mkstemp(suffix=".tmp")
+                with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+                    f.write(content)
+                result = _vfy.verify_file(tmp, title,
+                                          o_number=self._o_number or None)
+                score, vstatus = score_file(tmp, title, o_number=self._o_number)
+            finally:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        else:
+            result = _vfy.verify_file(self._file_path, title,
+                                      o_number=self._o_number or None)
+            score, vstatus = score_file(self._file_path, title,
+                                        o_number=self._o_number)
+        return result or {}, score, vstatus
 
     def _on_save(self):
         if not self._file_path or not self._editor.document().isModified():
             return
 
-        # ── Backup ──
-        if self.db_path:
-            auto_bak = db.get_setting(self.db_path, "auto_backup_on_edit", "1") == "1"
-            if auto_bak:
-                self._create_backup()
+        # ── Backup (non-fatal — never block save) ──
+        try:
+            if self.db_path:
+                auto_bak = db.get_setting(self.db_path, "auto_backup_on_edit", "1") == "1"
+                if auto_bak:
+                    self._create_backup()
+        except Exception as exc:
+            QMessageBox.warning(self, "Backup Warning",
+                f"Could not create backup (file will still be saved):\n{exc}")
 
         # ── Write file ──
         content = self._editor.toPlainText()
         try:
-            with open(self._file_path, "w", encoding="utf-8") as f:
+            with open(self._file_path, "w", encoding="utf-8", newline="") as f:
                 f.write(content)
         except Exception as exc:
             QMessageBox.critical(self, "Save Error", str(exc))
@@ -294,7 +481,7 @@ class EditorPanel(QWidget):
 
         self._editor.document().setModified(False)
 
-        # ── Update DB ──
+        # ── Update DB + re-verify ──
         if self._file_id and self.db_path:
             self._update_db_after_save()
 
@@ -523,5 +710,222 @@ class EditorPanel(QWidget):
             self._score_badge.set_score(score, vstatus)
             self._tokens_lbl.setText(vstatus or "  Not verified")
             self._apply_error_highlights()
+            # Auto-populate side panel after save
+            result = _vfy.verify_file(self._file_path, title,
+                                       o_number=self._o_number or None)
+            self._populate_verify_panel(result or {})
         except Exception as exc:
             QMessageBox.warning(self, "DB Update Warning", str(exc))
+
+    # ------------------------------------------------------------------
+    # Side-panel verify results
+    # ------------------------------------------------------------------
+
+    def _clear_verify_panel(self):
+        lay = self._verify_content_lay
+        while lay.count():
+            item = lay.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
+    def _vp_label(self, text: str, fg: str = "#aaaacc",
+                  bg: str = "transparent", bold: bool = False,
+                  size: int = 10) -> QLabel:
+        lbl = QLabel(text)
+        weight = "bold" if bold else "normal"
+        lbl.setStyleSheet(
+            f"color:{fg}; background:{bg}; font-size:{size}px; "
+            f"font-weight:{weight}; padding:2px 6px; font-family:Consolas;")
+        lbl.setWordWrap(True)
+        return lbl
+
+    def _vp_badge(self, ok) -> QLabel:
+        if ok is True:
+            return self._vp_label("PASS", "#44ee88", "#0a2a14", bold=True)
+        if ok is False:
+            return self._vp_label("FAIL", "#ff5555", "#2a0a0a", bold=True)
+        if ok == "loose":
+            return self._vp_label("LOOSE", "#ffaa33", "#2a1e00", bold=True)
+        return self._vp_label("N/F", "#555577", "#12131e", bold=True)
+
+    def _vp_separator(self) -> QFrame:
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color:#1a1d2e;")
+        sep.setFixedHeight(1)
+        return sep
+
+    def _vp_check_row(self, label: str, ok, detail: str,
+                      go_to_line: int | None = None):
+        """Add one check row to the verify side panel."""
+        lay = self._verify_content_lay
+        # Badge + label row
+        row_w = QWidget()
+        row_w.setStyleSheet("background:transparent;")
+        row_lay = QHBoxLayout(row_w)
+        row_lay.setContentsMargins(0, 2, 0, 0)
+        row_lay.setSpacing(6)
+        row_lay.addWidget(self._vp_badge(ok))
+        row_lay.addWidget(self._vp_label(label, "#ccccdd", bold=True, size=11))
+        row_lay.addStretch()
+        if go_to_line is not None and go_to_line > 0:
+            go_btn = QPushButton(f"Ln {go_to_line}")
+            go_btn.setFixedWidth(60)
+            go_btn.setStyleSheet(
+                "QPushButton{background:#1a1d2e;border:1px solid #2a2d45;"
+                "color:#6688aa;padding:1px 4px;border-radius:2px;font-size:9px;}"
+                "QPushButton:hover{background:#252840;}")
+            go_btn.clicked.connect(lambda checked, ln=go_to_line: self._goto_line(ln))
+            row_lay.addWidget(go_btn)
+        lay.addWidget(row_w)
+        # Detail text
+        if detail:
+            lay.addWidget(self._vp_label(detail, "#8899bb", size=9))
+        lay.addWidget(self._vp_separator())
+
+    def _goto_line(self, line_no: int):
+        block = self._editor.document().findBlockByLineNumber(line_no - 1)
+        if block.isValid():
+            cursor = self._editor.textCursor()
+            cursor.setPosition(block.position())
+            self._editor.setTextCursor(cursor)
+            self._editor.ensureCursorVisible()
+
+    def _populate_verify_panel(self, result: dict):
+        """Fill the side verify panel with check results."""
+        self._clear_verify_panel()
+        lay = self._verify_content_lay
+
+        if not result or result.get("error"):
+            msg = result.get("error", "No verification result") if result else "No result"
+            lay.addWidget(self._vp_label(msg, "#ff5555"))
+            lay.addStretch()
+            self._verify_pane.show()
+            return
+
+        specs = result.get("specs") or {}
+        rs    = specs.get("round_size_in")
+        cb_mm = specs.get("cb_mm")
+        ob_mm = specs.get("ob_mm")
+        th    = result.get("total_thickness")
+
+        # Spec summary
+        parts = []
+        if rs:    parts.append(f"Round {rs}\"")
+        if cb_mm: parts.append(f"CB {cb_mm:.2f}mm")
+        if ob_mm: parts.append(f"OB {ob_mm:.2f}mm")
+        if th:    parts.append(f"Thick {th:.3f}\"")
+        if parts:
+            lay.addWidget(self._vp_label("   ".join(parts), "#8899bb",
+                                         "#12131e", size=10))
+            lay.addWidget(self._vp_separator())
+
+        def _inch(v):
+            return f'{v:.4f}"' if v is not None else "—"
+
+        # ── CB ──
+        cb_ok = result.get("cb_ok")
+        cb_found = result.get("cb_found_in")
+        cb_exp = result.get("cb_expected_in")
+        cb_diff = result.get("cb_diff_in")
+        cb_detail = f"Found: {_inch(cb_found)}  Expected: {_inch(cb_exp)}"
+        if cb_diff is not None:
+            cb_detail += f"  Diff: {cb_diff:+.4f}\""
+        cb_f_ok = result.get("cb_f_ok")
+        if cb_f_ok is not None:
+            f_status = "OK" if cb_f_ok else "HIGH"
+            cb_detail += f"\nCB Feed: F{result.get('cb_f_found', '?'):.3f} (max F{result.get('cb_f_expected', 0.015):.3f}) [{f_status}]"
+        cb_ln = result.get("cb_context_hit_ln")
+        self._vp_check_row("CB  (Center Bore)", cb_ok, cb_detail, cb_ln)
+
+        # ── OB ──
+        ob_ok = result.get("ob_ok")
+        ob_found = result.get("ob_found_in")
+        ob_exp = result.get("ob_expected_in")
+        ob_diff = result.get("ob_diff_in")
+        ob_detail = f"Found: {_inch(ob_found)}  Expected: {_inch(ob_exp)}"
+        if ob_diff is not None:
+            ob_detail += f"  Diff: {ob_diff:+.4f}\""
+        ob_ln = result.get("ob_context_hit_ln")
+        self._vp_check_row("OB  (Outer Bore)", ob_ok, ob_detail, ob_ln)
+
+        # ── DR ──
+        dr_ok = result.get("dr_ok")
+        dr_depths = result.get("dr_depths") or []
+        dr_expected = result.get("dr_expected")
+        found_str = "  ".join(f'{d:.4f}"' for d in dr_depths) or "—"
+        if dr_expected is not None:
+            exp_str = (f'{dr_expected:.4f}"'
+                       if len(dr_depths) <= 1
+                       else f"sum >= {dr_expected:.4f}\"")
+        else:
+            exp_str = "—"
+        dr_detail = f"Found: {found_str}\nExpected: {exp_str}"
+        dr_note = result.get("dr_note")
+        if dr_note:
+            dr_detail += f"\n{dr_note}"
+        dr_ln = result.get("dr_context_hit_ln")
+        self._vp_check_row("DR  (Drill Depth)", dr_ok, dr_detail, dr_ln)
+
+        # ── OD ──
+        od_ok = result.get("od_ok")
+        op1_od = result.get("od_op1_found")
+        op2_od = result.get("od_op2_found")
+        od_exp = None
+        if rs:
+            od_rs = round(rs * 4) / 4
+            od_exp = _vfy._OD_TABLE.get(od_rs)
+        od_parts = []
+        if op1_od is not None: od_parts.append(f"OP1: {op1_od:.4f}\"")
+        if op2_od is not None: od_parts.append(f"OP2: {op2_od:.4f}\"")
+        od_detail = "Found: " + ("  ".join(od_parts) if od_parts else "—")
+        if od_exp is not None:
+            od_detail += f"\nExpected: {od_exp:.4f}\""
+        od_ln = result.get("od_op1_context_hit_ln") or result.get("od_op2_context_hit_ln")
+        self._vp_check_row("OD  (OD Turn)", od_ok, od_detail, od_ln)
+
+        # ── TZ ──
+        tz_ok = result.get("tz_ok")
+        tz_op1 = result.get("tz_op1_z")
+        tz_op2 = result.get("tz_op2_z")
+        tz_lim = result.get("tz_limit")
+        tz_parts = []
+        if tz_op1 is not None: tz_parts.append(f"OP1: Z{tz_op1:.4f}")
+        if tz_op2 is not None: tz_parts.append(f"OP2: Z{tz_op2:.4f}")
+        tz_detail = "Found: " + ("  ".join(tz_parts) if tz_parts else "—")
+        if tz_lim is not None:
+            tz_detail += f"\nLimit: Z{tz_lim:.4f}"
+        tz_note = result.get("tz_note")
+        if tz_note:
+            tz_detail += f"\n{tz_note}"
+        tz_ln = result.get("tz_context_hit_ln")
+        self._vp_check_row("TZ  (Turning Z)", tz_ok, tz_detail, tz_ln)
+
+        # ── PC ──
+        pc_ok = result.get("pcode_ok")
+        op1_p = result.get("op1_p")
+        op2_p = result.get("op2_p")
+        pc_exp = result.get("pcode_expected")
+        found_str = f"P{op1_p}/P{op2_p}" if op1_p and op2_p else "—"
+        exp_str = f"P{pc_exp[0]}/P{pc_exp[1]}" if pc_exp else "—"
+        pc_detail = f"Found: {found_str}  Expected: {exp_str}"
+        pc_lathe = result.get("pcode_lathe") or ""
+        if pc_lathe:
+            pc_detail += f"  ({pc_lathe})"
+        pc_ln = result.get("pcode_op1_context_hit_ln") or result.get("pcode_op2_context_hit_ln")
+        self._vp_check_row("PC  (P-Code)", pc_ok, pc_detail, pc_ln)
+
+        # ── HM ──
+        hm_ok = result.get("home_ok")
+        hm_found = result.get("home_zs_found") or []
+        hm_exp = result.get("home_z_expected")
+        found_str = "  ".join(f"Z{z:.4f}" for z in hm_found) or "—"
+        hm_detail = f"Found: {found_str}"
+        if hm_exp is not None:
+            hm_detail += f"\nExpected: >= Z{hm_exp:.4f}"
+        hm_ln = result.get("home_context_hit_ln")
+        self._vp_check_row("HM  (Home Position)", hm_ok, hm_detail, hm_ln)
+
+        lay.addStretch()
+        self._verify_pane.show()

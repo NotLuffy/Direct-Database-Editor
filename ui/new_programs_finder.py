@@ -113,17 +113,22 @@ class NewProgsFinder(QThread):
         self.new_progs = new_progs
 
     def run(self):
-        new_folder = os.path.normpath(os.path.join(self.new_progs, "new"))
-        os.makedirs(new_folder, exist_ok=True)
+        try:
+            new_folder = os.path.normpath(os.path.join(self.new_progs, "new"))
+            os.makedirs(new_folder, exist_ok=True)
 
-        self.progress.emit("Scanning Repository…")
-        known = _collect_o_numbers(self.repo)
-        known |= _collect_o_numbers(new_folder)   # also skip what's already in /new
-        self.progress.emit(f"{len(known):,} O-numbers already accounted for.")
+            self.progress.emit("Scanning Repository…")
+            known = _collect_o_numbers(self.repo)
+            known |= _collect_o_numbers(new_folder)
+            self.progress.emit(f"{len(known):,} O-numbers already accounted for.")
 
-        self.progress.emit("Scanning New Programs subfolders…")
-        candidates = _find_candidates(self.new_progs, new_folder, known)
-        self.progress.emit(f"{len(candidates):,} new file(s) to copy.")
+            self.progress.emit("Scanning New Programs subfolders…")
+            candidates = _find_candidates(self.new_progs, new_folder, known)
+            self.progress.emit(f"{len(candidates):,} new file(s) to copy.")
 
-        copied, skipped, errors = _copy_candidates(candidates, new_folder)
-        self.finished.emit(copied, skipped, errors)
+            copied, skipped, errors = _copy_candidates(candidates, new_folder)
+            self.finished.emit(copied, skipped, errors)
+        except Exception as exc:
+            import logging
+            logging.exception("NewProgsFinder worker crashed")
+            self.finished.emit(0, 0, [str(exc)])

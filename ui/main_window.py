@@ -29,6 +29,9 @@ from ui.scan_dialog import ScanProgressDialog
 from ui.editor_panel import EditorPanel
 from ui.dup_panel import DupPanel
 from ui.diff_panel import DiffPanel
+from ui.order_search_panel import OrderSearchPanel
+from ui.bug_report_dialog import BugReportDialog
+from ui.bug_list_panel import BugListPanel
 
 import verifier as _vfy
 
@@ -72,8 +75,8 @@ QMenu::item:selected { background: #2a3055; }
 # ---------------------------------------------------------------------------
 
 class _ReverifyWorker(QThread):
-    progress = pyqtSignal(int, int)   # done, total
-    finished = pyqtSignal(int)        # count updated
+    progress = pyqtSignal(int, int)      # done, total
+    finished = pyqtSignal(int, int)      # updated, failed
 
     def __init__(self, db_path: str, parent=None):
         super().__init__(parent)
@@ -84,39 +87,48 @@ class _ReverifyWorker(QThread):
         self._cancelled = True
 
     def run(self):
-        from direct_scorer import score_file
-        conn = db.get_connection(self.db_path)
-        rows = conn.execute(
-            "SELECT id, file_path, program_title, o_number FROM files "
-            "WHERE last_seen IS NOT NULL ORDER BY id"
-        ).fetchall()
-        conn.close()
+        if not self.db_path:
+            self.finished.emit(0)
+            return
+        try:
+            from direct_scorer import score_file
+            conn = db.get_connection(self.db_path)
+            rows = conn.execute(
+                "SELECT id, file_path, program_title, o_number FROM files "
+                "WHERE last_seen IS NOT NULL ORDER BY id"
+            ).fetchall()
+            conn.close()
 
-        total   = len(rows)
-        updated = 0
-        for i, row in enumerate(rows):
-            if self._cancelled:
-                break
-            path = row["file_path"]
-            if not os.path.exists(path):
-                continue
-            try:
-                score, vstatus = score_file(path, row["program_title"] or "",
-                                            o_number=row["o_number"] or "")
-                conn2 = db.get_connection(self.db_path)
-                with conn2:
-                    conn2.execute(
-                        "UPDATE files SET verify_score=?, verify_status=? WHERE id=?",
-                        (score, vstatus, row["id"])
-                    )
-                conn2.close()
-                updated += 1
-            except Exception:
-                pass
-            if i % 50 == 0 or i == total - 1:
-                self.progress.emit(i + 1, total)
+            total   = len(rows)
+            updated = 0
+            failed  = 0
+            for i, row in enumerate(rows):
+                if self._cancelled:
+                    break
+                path = row["file_path"]
+                if not path or not os.path.exists(path):
+                    continue
+                try:
+                    score, vstatus = score_file(path, row["program_title"] or "",
+                                                o_number=row["o_number"] or "")
+                    conn2 = db.get_connection(self.db_path)
+                    with conn2:
+                        conn2.execute(
+                            "UPDATE files SET verify_score=?, verify_status=? WHERE id=?",
+                            (score, vstatus, row["id"])
+                        )
+                    conn2.close()
+                    updated += 1
+                except Exception:
+                    failed += 1
+                if i % 50 == 0 or i == total - 1:
+                    self.progress.emit(i + 1, total)
 
-        self.finished.emit(updated)
+            self.finished.emit(updated, failed)
+        except Exception as exc:
+            import logging
+            logging.exception("ReverifyWorker crashed")
+            self.finished.emit(0, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +364,13 @@ class DirectMainWindow(QMainWindow):
         self._filters_btn.toggled.connect(self._on_filters_toggle)
         tb.addWidget(self._filters_btn)
 
+        self._order_search_btn = self._tb_btn("Order Search", "#0a1a12", "#55ddaa")
+        self._order_search_btn.setCheckable(True)
+        self._order_search_btn.setToolTip(
+            "Search for programs by pasting an order sheet row (columns I–M)")
+        self._order_search_btn.toggled.connect(self._on_order_search_toggle)
+        tb.addWidget(self._order_search_btn)
+
         tb.addSeparator()
 
         self._export_btn = self._tb_btn("Export XLSX", "#1a1a0a", "#ddcc44")
@@ -387,6 +406,20 @@ class DirectMainWindow(QMainWindow):
         self._settings_btn.clicked.connect(self._on_settings)
         tb.addWidget(self._settings_btn)
 
+        tb.addSeparator()
+
+        self._bug_report_btn = self._tb_btn("Report Bug", "#1a0a0a", "#ff7755")
+        self._bug_report_btn.setToolTip(
+            "Report a bug or issue — saved to the database for review")
+        self._bug_report_btn.clicked.connect(self._on_report_bug)
+        tb.addWidget(self._bug_report_btn)
+
+        self._bug_list_btn = self._tb_btn("Bug Reports", "#1a0808", "#dd6644")
+        self._bug_list_btn.setCheckable(True)
+        self._bug_list_btn.setToolTip("View and manage submitted bug reports")
+        self._bug_list_btn.toggled.connect(self._on_bug_list_toggle)
+        tb.addWidget(self._bug_list_btn)
+
         # ── Central widget ──
         central = QWidget()
         self.setCentralWidget(central)
@@ -400,16 +433,23 @@ class DirectMainWindow(QMainWindow):
         self._filter_bar.filters_changed.connect(self._on_filters_changed)
         root.addWidget(self._filter_bar)
 
-        # Main splitter: sidebar | content
+        # Main splitter: sidebar | [order search panel] | content
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setHandleWidth(4)
         splitter.setStyleSheet("QSplitter::handle { background: #1a1d2e; }")
         root.addWidget(splitter, stretch=1)
+        self._main_splitter = splitter
 
         # Sidebar
         self._sidebar = DirectSidebar()
         self._sidebar.filter_selected.connect(self._on_sidebar_filter)
         splitter.addWidget(self._sidebar)
+
+        # Order search panel (hidden by default, index 1)
+        self._order_search_panel = OrderSearchPanel()
+        self._order_search_panel.setVisible(False)
+        self._order_search_panel.go_to_file.connect(self._on_order_search_go_to_file)
+        splitter.addWidget(self._order_search_panel)
 
         # Right pane: header + table
         right = QWidget()
@@ -423,6 +463,14 @@ class DirectMainWindow(QMainWindow):
             "padding:4px 8px; background:#0d0e18; border-bottom:1px solid #1a1d2e;"
         )
         right_lay.addWidget(self._table_header)
+
+        # Empty-state overlay — shown when the table has 0 rows
+        self._empty_lbl = QLabel()
+        self._empty_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty_lbl.setStyleSheet(
+            "color:#334455; font-size:14px; background:#080910;")
+        self._empty_lbl.setVisible(False)
+        right_lay.addWidget(self._empty_lbl)
 
         self._table = QTableView()
         self._table.setModel(self._proxy)
@@ -507,13 +555,16 @@ class DirectMainWindow(QMainWindow):
         self._tools_panel.open_new_progs_finder.connect(self._open_new_progs_finder)
         self._bottom_tabs.addTab(self._tools_panel, "Tools")
 
+        self._bug_list_panel = BugListPanel()
+        self._bottom_tabs.addTab(self._bug_list_panel, "Bug Reports")
+
         right_vsplit.addWidget(self._bottom_tabs)
         right_vsplit.setSizes([500, 280])
 
         right_lay.addWidget(right_vsplit, stretch=1)
 
         splitter.addWidget(right)
-        splitter.setSizes([190, 1010])
+        splitter.setSizes([190, 0, 1010])
 
         # Status bar
         self._status_bar = QStatusBar()
@@ -571,11 +622,32 @@ class DirectMainWindow(QMainWindow):
                 self.db_path      = db_path
                 self.scan_folders = [f for f in folders if os.path.isdir(f)]
                 self._on_workspace_ready()
-            # Restore hidden columns (applies whether or not a DB was loaded)
+            # Restore hidden columns
             hdr = self._table.horizontalHeader()
             for col in cfg.get("hidden_columns", []):
                 if 0 <= col < len(COLUMNS):
                     hdr.setSectionHidden(col, True)
+            # Restore column widths
+            for col_str, width in cfg.get("column_widths", {}).items():
+                try:
+                    hdr.resizeSection(int(col_str), int(width))
+                except Exception:
+                    pass
+            # Restore window geometry
+            geom = cfg.get("window_geometry")
+            if geom:
+                try:
+                    from PyQt6.QtCore import QByteArray
+                    self.restoreGeometry(QByteArray.fromHex(geom.encode()))
+                except Exception:
+                    pass
+            # Restore splitter sizes
+            main_sizes = cfg.get("main_splitter_sizes")
+            if main_sizes:
+                try:
+                    self._main_splitter.setSizes(main_sizes)
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -583,6 +655,9 @@ class DirectMainWindow(QMainWindow):
         try:
             hdr = self._table.horizontalHeader()
             hidden = [i for i in range(len(COLUMNS)) if hdr.isSectionHidden(i)]
+            col_widths = {str(i): hdr.sectionSize(i)
+                          for i in range(len(COLUMNS))
+                          if not hdr.isSectionHidden(i)}
             # Preserve existing verify_overrides if present
             verify_overrides = {}
             if os.path.exists(self.config_path):
@@ -592,14 +667,17 @@ class DirectMainWindow(QMainWindow):
                     verify_overrides = existing.get("verify_overrides", {})
                 except Exception:
                     pass
+            cfg = {
+                "scan_folders":       self.scan_folders,
+                "db_path":            self.db_path,
+                "hidden_columns":     hidden,
+                "column_widths":      col_widths,
+                "window_geometry":    self.saveGeometry().toHex().data().decode(),
+                "main_splitter_sizes": self._main_splitter.sizes(),
+            }
+            if verify_overrides:
+                cfg["verify_overrides"] = verify_overrides
             with open(self.config_path, "w") as f:
-                cfg = {
-                    "scan_folders":  self.scan_folders,
-                    "db_path":       self.db_path,
-                    "hidden_columns": hidden,
-                }
-                if verify_overrides:
-                    cfg["verify_overrides"] = verify_overrides
                 json.dump(cfg, f, indent=2)
         except Exception:
             pass
@@ -744,6 +822,8 @@ class DirectMainWindow(QMainWindow):
         self._editor_panel.db_path = self.db_path
         self._dup_panel.db_path    = self.db_path
         self._verify_panel.clear()
+        self._order_search_panel.set_db_path(self.db_path)
+        self._bug_list_panel.set_db_path(self.db_path)
 
         if self._model is None:
             self._model = DirectFileTableModel(self.db_path,
@@ -980,6 +1060,17 @@ class DirectMainWindow(QMainWindow):
         self._table_header.setText(f"  Files  ({n:,})")
         self._status_bar.showMessage(
             f"{n:,} files shown  |  DB: {self.db_path}")
+        # Show empty-state message when no rows visible
+        if n == 0 and self.db_path:
+            filters_active = bool(self._filter_bar.isVisible() and
+                                  self._filter_bar.current_filters())
+            if filters_active:
+                msg = "No files match the current filters\nClick Filters to adjust or clear them"
+            else:
+                msg = "No files found\nAdd a folder and click Rescan to import your programs"
+            self._empty_lbl.setText(msg)
+        self._empty_lbl.setVisible(n == 0 and bool(self.db_path))
+        self._table.setVisible(n > 0 or not self.db_path)
 
     # ------------------------------------------------------------------
     # Sidebar filter
@@ -1071,6 +1162,54 @@ class DirectMainWindow(QMainWindow):
         self._filter_bar.setVisible(checked)
         if not checked:
             self._filter_bar.reset()
+
+    # ------------------------------------------------------------------
+    # Order search
+    # ------------------------------------------------------------------
+
+    def _on_order_search_toggle(self, checked: bool):
+        self._order_search_panel.setVisible(checked)
+        sizes = self._main_splitter.sizes()
+        if checked:
+            total = sum(sizes)
+            sidebar_w = sizes[0]
+            panel_w   = 290
+            right_w   = max(400, total - sidebar_w - panel_w)
+            self._main_splitter.setSizes([sidebar_w, panel_w, right_w])
+            self._order_search_panel.set_db_path(self.db_path)
+        else:
+            total = sum(sizes)
+            self._main_splitter.setSizes([sizes[0], 0, total - sizes[0]])
+
+    def _on_order_search_go_to_file(self, file_id: int):
+        """Navigate the main table to the given file_id, clearing filters first."""
+        if self._model is None:
+            return
+
+        # Clear filters so the target row is definitely visible
+        self._filters_btn.setChecked(False)
+        self._filter_bar.reset()
+        self._model.refresh({})
+        self._proxy.set_filters({})
+
+        # Linear scan to find the source row
+        source_row = None
+        for r in range(self._model.rowCount()):
+            if self._model.get_file_id(r) == file_id:
+                source_row = r
+                break
+
+        if source_row is None:
+            return
+
+        source_idx = self._model.index(source_row, 0)
+        proxy_idx  = self._proxy.mapFromSource(source_idx)
+        if not proxy_idx.isValid():
+            return
+
+        self._table.setCurrentIndex(proxy_idx)
+        self._table.scrollTo(proxy_idx, QAbstractItemView.ScrollHint.PositionAtCenter)
+        self._table.setFocus()
 
     def _on_filters_changed(self, filters: dict):
         if self._model is None:
@@ -1237,6 +1376,8 @@ class DirectMainWindow(QMainWindow):
 
     def _action_reverify_selected(self, recs: list[dict]):
         """Re-run verification on the selected files and update the DB."""
+        if not self.db_path:
+            return
         from direct_scorer import (score_file, parse_overrides,
                                    apply_overrides_to_status)
         updated = 0
@@ -1463,6 +1604,18 @@ class DirectMainWindow(QMainWindow):
         self._bottom_tabs.setCurrentWidget(self._diff_panel)
 
     def _set_status_multi(self, recs: list[dict], status: str):
+        if status == "delete" and recs:
+            names = "\n".join(f"  {r['file_name']}" for r in recs[:10])
+            if len(recs) > 10:
+                names += f"\n  … and {len(recs) - 10} more"
+            reply = QMessageBox.warning(
+                self, "Mark for Deletion",
+                f"Mark {len(recs)} file(s) for deletion?\n\n{names}\n\n"
+                "Files are NOT deleted yet — use Empty Trash to permanently remove them.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel)
+            if reply != QMessageBox.StandardButton.Yes:
+                return
         for rec in recs:
             db.update_file_status(self.db_path, rec["id"], status)
         self._refresh_all()
@@ -1505,6 +1658,8 @@ class DirectMainWindow(QMainWindow):
 
     def _apply_verify_override(self, rec: dict, check_token: str, value: str):
         """Override a single verification check to PASS or FAIL."""
+        if not self.db_path:
+            return
         from direct_scorer import (set_override_in_notes, parse_overrides,
                                    apply_overrides_to_status)
         notes = rec.get("notes", "") or ""
@@ -1849,14 +2004,17 @@ class DirectMainWindow(QMainWindow):
             dlg.setValue(pct)
             dlg.setLabelText(f"Re-verifying files…  {done:,} / {total:,}")
 
-    def _on_reverify_done(self, updated: int):
+    def _on_reverify_done(self, updated: int, failed: int):
         dlg = getattr(self, "_reverify_dlg", None)
         if dlg:
             dlg.close()
             self._reverify_dlg = None
         self._reverify_btn.setEnabled(True)
         self._reverify_btn.setText("Re-Verify All")
-        self._status_bar.showMessage(f"Re-verify complete — {updated:,} files updated.")
+        msg = f"Re-verify complete — {updated:,} files updated."
+        if failed:
+            msg += f"  ({failed} file(s) could not be verified — check error log)"
+        self._status_bar.showMessage(msg)
         self._refresh_all()
         # Reload verify panel for the currently selected row (scores may have changed)
         if hasattr(self, "_verify_panel"):
@@ -1930,11 +2088,9 @@ class DirectMainWindow(QMainWindow):
 
     def _on_auto_resolve_dupes(self):
         """
-        For every dup group where all members share the same base O-number
-        (regardless of file extension), keep the single best file and mark
-        the rest as status='delete'.
-
-        Best = highest verify_score; tiebreak = most line_count.
+        For every dup group where all members share the same base O-number,
+        keep the best file (highest score, then most lines) and mark the rest
+        as status='delete'. Shows a preview before committing any changes.
         """
         if not self.db_path:
             return
@@ -1942,71 +2098,86 @@ class DirectMainWindow(QMainWindow):
         import direct_database as _db
 
         conn = _db.get_connection(self.db_path)
-
-        # Fetch every dup group with its member file details in one pass
         groups = conn.execute("SELECT id FROM dup_groups").fetchall()
 
-        groups_resolved = 0
-        files_marked    = 0
+        # ── Dry-run: build the list of proposed changes ──────────────────
+        plan = []   # (winner_name, [loser_name, ...])
+        for grp in groups:
+            gid     = grp["id"]
+            members = conn.execute("""
+                SELECT f.id, f.o_number, f.verify_score, f.line_count,
+                       f.status, f.file_name
+                FROM files f
+                JOIN dup_group_members dgm ON f.id = dgm.file_id
+                WHERE dgm.group_id = ?
+            """, (gid,)).fetchall()
 
-        with conn:
-            for grp in groups:
-                gid     = grp["id"]
-                members = conn.execute("""
-                    SELECT f.id, f.o_number, f.verify_score, f.line_count,
-                           f.status, f.file_name
-                    FROM files f
-                    JOIN dup_group_members dgm ON f.id = dgm.file_id
-                    WHERE dgm.group_id = ?
-                """, (gid,)).fetchall()
+            if len(members) < 2:
+                continue
+            o_numbers = {(m["o_number"] or "").upper().strip() for m in members}
+            if len(o_numbers) != 1 or "" in o_numbers:
+                continue
+            if any((m["status"] or "") == "shop_special" for m in members):
+                continue
 
-                if len(members) < 2:
-                    continue
-
-                # Normalise O-numbers — strip extension, uppercase
-                def _base_onum(fname, onum):
-                    # Use the stored o_number which is already normalised
-                    return (onum or "").upper().strip()
-
-                o_numbers = {_base_onum(m["file_name"], m["o_number"])
-                             for m in members}
-
-                # Only auto-resolve when every member has the same O-number
-                if len(o_numbers) != 1 or "" in o_numbers:
-                    continue
-
-                # Skip if any member is shop_special — leave those alone
-                if any((m["status"] or "") == "shop_special" for m in members):
-                    continue
-
-                # Pick winner: best score, then most lines
-                winner = max(
-                    members,
-                    key=lambda m: (m["verify_score"] or 0, m["line_count"] or 0)
-                )
-
-                losers = [m for m in members if m["id"] != winner["id"]]
-
-                for loser in losers:
-                    # Only mark if not already deleted/trashed
-                    if (loser["status"] or "") not in ("delete", "shop_special"):
-                        conn.execute(
-                            "UPDATE files SET status='delete' WHERE id=?",
-                            (loser["id"],)
-                        )
-                        files_marked += 1
-
-                groups_resolved += 1
+            winner = max(members,
+                         key=lambda m: (m["verify_score"] or 0, m["line_count"] or 0))
+            losers = [m for m in members
+                      if m["id"] != winner["id"]
+                      and (m["status"] or "") not in ("delete", "shop_special")]
+            if losers:
+                plan.append((winner, losers))
 
         conn.close()
 
+        if not plan:
+            QMessageBox.information(self, "Auto-Resolve",
+                "No groups found that can be auto-resolved.\n"
+                "(Groups with mixed O-numbers or shop-special files are skipped.)")
+            return
+
+        total_losers = sum(len(p[1]) for p in plan)
+        preview_lines = []
+        for winner, losers in plan[:15]:
+            preview_lines.append(
+                f"  KEEP  {winner['file_name']}  "
+                f"(score {winner['verify_score'] or 0}/7, {winner['line_count'] or 0} lines)")
+            for loser in losers:
+                preview_lines.append(
+                    f"  DELETE  {loser['file_name']}  "
+                    f"(score {loser['verify_score'] or 0}/7, {loser['line_count'] or 0} lines)")
+            preview_lines.append("")
+        if len(plan) > 15:
+            preview_lines.append(f"  … and {len(plan) - 15} more group(s)")
+
+        reply = QMessageBox.warning(
+            self, "Auto-Resolve Duplicates — Preview",
+            f"This will mark {total_losers} file(s) for deletion "
+            f"across {len(plan)} group(s).\n\n"
+            f"Files are NOT deleted immediately — use Empty Trash to permanently remove them.\n\n"
+            + "\n".join(preview_lines),
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+
+        if reply != QMessageBox.StandardButton.Ok:
+            return
+
+        # ── Commit the changes ────────────────────────────────────────────
+        conn2 = _db.get_connection(self.db_path)
+        files_marked = 0
+        with conn2:
+            for winner, losers in plan:
+                for loser in losers:
+                    conn2.execute(
+                        "UPDATE files SET status='delete' WHERE id=?", (loser["id"],))
+                    files_marked += 1
+        conn2.close()
+
         QMessageBox.information(
             self, "Auto-Resolve Complete",
-            f"{groups_resolved} group(s) resolved.\n"
+            f"{len(plan)} group(s) resolved.\n"
             f"{files_marked} file(s) marked for deletion.\n\n"
-            f"Review them in the 'Mark Delete' filter, then use "
-            f"'Empty Trash' to permanently remove."
-        )
+            "Review them using the Delete filter, then use Empty Trash to permanently remove.")
         self._refresh_all()
 
     # ------------------------------------------------------------------
@@ -2417,6 +2588,26 @@ class DirectMainWindow(QMainWindow):
         layout.addWidget(scroll)
 
         return tab, controls
+
+    def _on_report_bug(self):
+        if not self.db_path:
+            QMessageBox.information(self, "Report Bug",
+                "Open a workspace first to enable bug reporting.")
+            return
+        dlg = BugReportDialog(self.db_path, self)
+        if dlg.exec() == dlg.DialogCode.Accepted:
+            self._bug_list_panel.set_db_path(self.db_path)
+            self._bottom_tabs.setCurrentWidget(self._bug_list_panel)
+
+    def _on_bug_list_toggle(self, checked: bool):
+        if checked:
+            self._bottom_tabs.setCurrentWidget(self._bug_list_panel)
+        self._bug_list_btn.setChecked(False)   # don't stay toggled — just navigate
+
+    def closeEvent(self, event):
+        """Save window state before closing."""
+        self._save_config()
+        super().closeEvent(event)
 
     def _on_settings(self):
         if not self.db_path:

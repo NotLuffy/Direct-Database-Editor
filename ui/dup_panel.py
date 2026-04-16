@@ -243,7 +243,7 @@ class DupPanel(QWidget):
         self._group_combo.blockSignals(True)
         self._group_combo.clear()
         for g in self._groups:
-            onum = f"  O={g['o_number']}" if g.get("o_number") else ""
+            onum = f"  O={g['o_number']}" if g["o_number"] else ""
             label = (
                 f"{_TYPE_LABELS.get(g['group_type'], g['group_type'])}{onum}  "
                 f"({g['member_count']} files)"

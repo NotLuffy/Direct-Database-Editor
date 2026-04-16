@@ -653,9 +653,19 @@ class EditorPanel(QWidget):
                 "", QFileDialog.Option.ShowDirsOnly
             )
             if not folder:
-                return   # user skipped — still save without backup
+                QMessageBox.warning(self, "No Backup Created",
+                    "No backup folder was chosen.\n\n"
+                    "The file will be saved, but without a backup copy.\n"
+                    "You can set a backup folder in Settings at any time.")
+                return
             backup_folder = os.path.normpath(folder)
             db.set_setting(self.db_path, "backup_folder", backup_folder)
+        elif not os.path.isdir(backup_folder):
+            QMessageBox.warning(self, "Backup Folder Missing",
+                f"Your backup folder no longer exists:\n{backup_folder}\n\n"
+                "The file will be saved without a backup.\n"
+                "Please update your backup folder in Settings.")
+            return
 
         ext       = db.get_setting(self.db_path, "backup_extension", ".bak")
         fname     = os.path.basename(self._file_path)
@@ -835,7 +845,19 @@ class EditorPanel(QWidget):
         cb_f_ok = result.get("cb_f_ok")
         if cb_f_ok is not None:
             f_status = "OK" if cb_f_ok else "HIGH"
-            cb_detail += f"\nCB Feed: F{result.get('cb_f_found', '?'):.3f} (max F{result.get('cb_f_expected', 0.015):.3f}) [{f_status}]"
+            cb_detail += f"\nFinish feed: F{result.get('cb_f_found', '?'):.3f} (max F{result.get('cb_f_expected', 0.015):.3f}) [{f_status}]"
+        # Rough bore F-value check (underbore passes must use F0.02, finish must use F0.015)
+        rb_rough_f_ok = result.get("rb_rough_f_ok")
+        rb_finish_f_ok = result.get("rb_finish_f_ok")
+        rb_finish_f_found = result.get("rb_finish_f_found")
+        if rb_rough_f_ok is not None:
+            status = "OK" if rb_rough_f_ok else "FAIL"
+            cb_detail += f"\nRough passes F: [{status}] (must be ≤F0.020)"
+        if rb_finish_f_ok is not None and cb_f_ok is None:
+            # Only show if not already shown via cb_f_ok above
+            f_str = f"F{rb_finish_f_found:.3f}" if rb_finish_f_found is not None else "F?"
+            status = "OK" if rb_finish_f_ok else "HIGH"
+            cb_detail += f"\nFinish feed: {f_str} (max F0.015) [{status}]"
         cb_ln = result.get("cb_context_hit_ln")
         self._vp_check_row("CB  (Center Bore)", cb_ok, cb_detail, cb_ln)
 

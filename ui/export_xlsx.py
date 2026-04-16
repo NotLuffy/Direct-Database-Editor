@@ -171,7 +171,7 @@ def _sort_key(r: dict) -> tuple:
 def _build_row(rec) -> dict:
     title  = rec["program_title"] or ""
     sp     = _specs(title)
-    ptype  = _part_type(title)
+    ptype  = _part_type(title, rec["verify_status"] or "" if "verify_status" in rec.keys() else "")
 
     rs_in  = sp.get("round_size_in")
     cb_mm  = sp.get("cb_mm")

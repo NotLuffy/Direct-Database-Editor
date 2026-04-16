@@ -38,14 +38,17 @@ def _is_steel_ring(title: str) -> bool:
 
 _PART_TYPE_FILTERS: dict = {
     # Standard = single-piece disc, no hub of any kind (title-based)
-    "Standard":    lambda t: not _has_hub(t) and not _is_2pc(t),
+    "Standard":    lambda t: not _has_hub(t) and not _is_2pc(t)
+                             and not re.search(r'\bSTEP\b', t, _PT),
     "HC — any":    lambda t: _has_hub(t),
     "HC — 15MM":   lambda t: bool(re.search(
                        r'\b15\s*MM\s*HC\b|\bHC\s*15\s*MM\b', t, _PT)),
-    # 2PC: "--2PC", "-2PC", "2PC" anywhere in title
+    # 2PC: "--2PC", "-2PC", "2PC" anywhere in title (with hub = 2PC HC)
     "2PC":         lambda t: _is_2pc(t),
+    "2PC HC":      lambda t: _is_2pc(t) and _has_hub(t),
     "LUG":         lambda t: bool(re.search(r'\bLUG\b',    t, _PT)),
     "STUD":        lambda t: bool(re.search(r'\bSTUD\b',   t, _PT)),
+    # STEP: title-based — re.search is case-insensitive, word boundary on both sides
     "STEP":        lambda t: bool(re.search(r'\bSTEP\b',   t, _PT)),
     "SPACER":      lambda t: bool(re.search(r'\bSPACER\b', t, _PT)),
     # Steel Ring: STEEL RING, STL RING, HCS-1, HCS-2, bare HCS
@@ -105,16 +108,32 @@ def _score_color(score: int) -> QColor:
 
 _PT = re.IGNORECASE
 
-def _part_type(title: str) -> str:
-    """Derive a short part-type label from the program title."""
+def _part_type(title: str, vstatus: str = "") -> str:
+    """Derive a short part-type label from the program title.
+
+    vstatus: verify_status string from DB — used to detect 2PC hub presence
+    when it is not explicitly stated in the title (IH: token = implicit hub).
+    Priority order: STEP > 2PC HC > 2PC > 15MM HC > STEEL > SPACER > LUG > STUD > HC > STD
+    """
     if not title:
         return "STD"
-    if re.search(r'\b15\s*MM\s*HC\b', title, _PT):
-        return "15MM HC"
-    if re.search(r'-*2\s*PC\b', title, _PT):
-        return "2PC"
+
+    # STEP takes top priority — some STEP programs also have HC or 2PC in the title
     if re.search(r'\bSTEP\b', title, _PT):
         return "STEP"
+
+    # 2PC with hub detection
+    if re.search(r'-*2\s*PC\b', title, _PT):
+        # Check title for HC keyword
+        hub_in_title = _has_hub(title)
+        # Check verify_status for implicit hub token (IH:N.NNN")
+        hub_in_vstatus = bool(re.search(r'\bIH:\d+\.\d+', vstatus))
+        if hub_in_title or hub_in_vstatus:
+            return "2PC HC"
+        return "2PC"
+
+    if re.search(r'\b15\s*MM\s*HC\b', title, _PT):
+        return "15MM HC"
     if re.search(r'\b(?:STEEL|STL)[\s._-]*RING\b|\bHCS-?\d*\b|\bSTEEL\s+S-\d+\b', title, _PT):
         return "STEEL"
     if re.search(r'\bSPACER\b', title, _PT):
@@ -133,6 +152,7 @@ _TYPE_COLORS = {
     "HC":     QColor("#cc88ff"),   # purple
     "15MM HC":QColor("#ff88ff"),   # pink-purple
     "2PC":    QColor("#44ddcc"),   # teal
+    "2PC HC": QColor("#44ffaa"),   # green-teal (2PC with hub)
     "STEP":   QColor("#ffaa44"),   # orange
     "STEEL":  QColor("#ff6688"),   # rose
     "SPACER": QColor("#66ccff"),   # light blue
@@ -216,9 +236,11 @@ class DirectFileTableModel(QAbstractTableModel):
         val  = row[key] if key in row.keys() else None
         st   = row["status"] or "active"
 
-        # part_type is virtual — derive from program_title
+        # part_type is virtual — derive from program_title + verify_status
         if key == "part_type":
-            pt = _part_type(row["program_title"] or "" if "program_title" in row.keys() else "")
+            _title   = row["program_title"] or "" if "program_title" in row.keys() else ""
+            _vstatus = row["verify_status"]  or "" if "verify_status"  in row.keys() else ""
+            pt = _part_type(_title, _vstatus)
             if role == Qt.ItemDataRole.DisplayRole:
                 return pt
             if role == Qt.ItemDataRole.ForegroundRole:

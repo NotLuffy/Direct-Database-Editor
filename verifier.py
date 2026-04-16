@@ -39,8 +39,16 @@ TOLERANCE_IN   = 0.001   # ±0.001" acceptance window (CB / OB)
 DR_TOLERANCE_IN = 0.020  # ±0.020" acceptance window (drill depth)
 OD_TOLERANCE_IN = 0.015  # ±0.015" acceptance window (OD turn-down)
 
-# CB special offsets
-_CB_116_7_ACTUAL_MM = 116.9   # 116.7mm title → 116.9mm in code (+0.2 instead of +0.1)
+# CB special offsets — some nominal bore diameters use +0.2mm (instead of standard +0.1mm)
+# These are kept in a dict so future additions are a single-line edit.
+_CB_SPECIAL_MM: dict[float, float] = {
+    116.7: 116.9,   # 116.7mm title → code X4.602" (116.9mm / 25.4)
+    125.0: 125.2,   # 125.0mm title → code X4.929" (125.2mm / 25.4)
+}
+# Wider tolerance for special-offset CB values (they span a tighter machining window)
+_CB_SPECIAL_TOL_IN = 0.003   # ±0.003" (vs standard ±0.001")
+# Keep old name for backward compatibility with _DEFAULTS dict below
+_CB_116_7_ACTUAL_MM = _CB_SPECIAL_MM[116.7]
 
 # Steel ring detection — STEEL RING, STL RING, HCS-1/HCS-2, and STEEL S-N (grade designations)
 _STEEL_RING_RE = re.compile(
@@ -848,6 +856,11 @@ def _read_internal_onum(path: str) -> str | None:
     return None
 
 
+_RB_ROUGH_F   = 0.020   # expected feed rate for rough (underbore) passes
+_RB_FINISH_F  = 0.015   # expected feed rate for finish pass to CB dimension
+_RB_F_TOL     = 0.002   # ±tolerance when checking pass F values
+
+
 def _find_rough_bore(pre_flip_lines: list, cb_mm: float) -> dict:
     """Analyze the T121 pre-flip bore block for rough bore pass checks.
 
@@ -858,6 +871,7 @@ def _find_rough_bore(pre_flip_lines: list, cb_mm: float) -> dict:
       rb_approach_x     — X value from positioning line (float or None)
       rb_pass_xs        — list of X values at each Z-plunge bore pass
       rb_pass_zs        — list of Z depths (negative floats) at each bore pass
+      rb_pass_fs        — list of modal F values at each bore pass (float or None)
       rb_start_ok       — True if approach_x < _RB_FLAG_X; None if skip or NF
       rb_steps_ok       — True if all consecutive increments ≤ _RB_STEP_LIMIT; None if <2 passes
       rb_max_step       — largest step found (float or None)
@@ -865,14 +879,19 @@ def _find_rough_bore(pre_flip_lines: list, cb_mm: float) -> dict:
       rb_skip_cb        — True if CB < 58mm (start check not applicable)
       rb_deep_ok        — True if all passes beyond X6.8 have decreasing Z depth; None if N/A
       rb_deep_violations — list of (x_prev, z_prev, x_curr, z_curr) tuples where Z didn't decrease
+      rb_rough_f_ok     — True if all rough passes use F ≤ 0.020; None if not enough data
+      rb_finish_f_ok    — True if the last (finish) pass uses F ≤ 0.015; None if not enough data
+      rb_finish_f_found — F value on the last bore pass (float or None)
     """
     in_t121    = False
     approach_x = None
     modal_x    = None
+    modal_f    = None   # current modal F value
     in_feed    = False
     pass_xs    = []   # X value recorded at each Z-plunge bore pass
     pass_zs    = []   # Z depth at each bore pass (negative)
     pass_lns   = []   # 1-based file line number for each bore pass
+    pass_fs    = []   # modal F at each bore pass (None if unknown)
 
     for file_idx, ln in enumerate(pre_flip_lines):
         s = ln.strip()
@@ -880,6 +899,7 @@ def _find_rough_bore(pre_flip_lines: list, cb_mm: float) -> dict:
         if _T121_RE.search(s):
             in_t121 = True
             modal_x = None
+            modal_f = None
             in_feed = False
             continue
         if not in_t121:
@@ -895,6 +915,11 @@ def _find_rough_bore(pre_flip_lines: list, cb_mm: float) -> dict:
             if xm:
                 approach_x = abs(float(xm.group(1)))
                 modal_x    = approach_x
+
+        # Track modal F (any F word on a non-comment line)
+        fm = _F_RE.search(_INLINE_CMT_RE.sub('', s))
+        if fm:
+            modal_f = float(fm.group(1))
 
         # Track modal X (any non-G53 line with X > 0.3 updates modal)
         xm = _X_RE.search(s)
@@ -931,6 +956,7 @@ def _find_rough_bore(pre_flip_lines: list, cb_mm: float) -> dict:
                         pass_xs.append(pass_x)
                         pass_zs.append(pass_z)
                         pass_lns.append(line_no)
+                        pass_fs.append(modal_f)
 
     # Fall back: use first pass X as approach if no G154/G54 line had an X
     if approach_x is None and pass_xs:
@@ -988,11 +1014,31 @@ def _find_rough_bore(pre_flip_lines: list, cb_mm: float) -> dict:
                 rb_deep_violations.append((x_prev, z_prev, x_curr, z_curr, ln_curr))
             rb_deep_ok = len(rb_deep_violations) == 0
 
+    # --- Feed-rate checks for rough vs finish passes ---
+    # When there are ≥2 bore passes, the LAST one is the finish pass (to CB dim).
+    # All passes before the last are "rough" (underbore) passes.
+    # Rough passes should use F ≤ 0.020; finish pass should use F ≤ 0.015.
+    rb_rough_f_ok     = None
+    rb_finish_f_ok    = None
+    rb_finish_f_found = None
+    if len(pass_fs) >= 1:
+        # Finish pass F check (last recorded pass)
+        finish_f = pass_fs[-1]
+        if finish_f is not None:
+            rb_finish_f_found = finish_f
+            rb_finish_f_ok    = finish_f <= _RB_FINISH_F + _RB_F_TOL
+        # Rough pass F check (all passes before the last, when ≥2 passes exist)
+        if len(pass_fs) >= 2:
+            rough_fs = [f for f in pass_fs[:-1] if f is not None]
+            if rough_fs:
+                rb_rough_f_ok = all(f <= _RB_ROUGH_F + _RB_F_TOL for f in rough_fs)
+
     return {
         "rb_approach_x":      approach_x,
         "rb_pass_xs":         pass_xs,
         "rb_pass_zs":         pass_zs,
         "rb_pass_lns":        pass_lns,
+        "rb_pass_fs":         pass_fs,
         "rb_start_ok":        rb_start_ok,
         "rb_steps_ok":        rb_steps_ok,
         "rb_max_step":        rb_max_step,
@@ -1000,6 +1046,9 @@ def _find_rough_bore(pre_flip_lines: list, cb_mm: float) -> dict:
         "rb_skip_cb":         skip_cb,
         "rb_deep_ok":         rb_deep_ok,
         "rb_deep_violations": rb_deep_violations,
+        "rb_rough_f_ok":      rb_rough_f_ok,
+        "rb_finish_f_ok":     rb_finish_f_ok,
+        "rb_finish_f_found":  rb_finish_f_found,
     }
 
 
@@ -1324,22 +1373,27 @@ def verify_file(path: str, title: str, o_number: str = None) -> dict:
     post_flip = lines[flip_idx + 1:] if flip_idx is not None else []
 
     # --- Find G154 work-offset P-codes (OP1 = first in pre-flip, OP2 = first in post-flip) ---
-    # If no G154 is used at all and G54/G55 appears → program uses direct work offsets (no P-codes).
+    # Strip inline comments before searching so G154 inside (parentheses) is never matched.
+    # Take the LAST G154 hit per section (not first) — programs often have a G154 in the
+    # header/preamble for positioning, then the real offset call later; changed P-codes are
+    # typically in the last call before actual cutting, so last-hit is more reliable.
     op1_p, op2_p = None, None
     op1_p_hit, op2_p_hit = None, None
     for i, ln in enumerate(pre_flip):
-        m = _G154_RE.search(ln)
+        s = _INLINE_CMT_RE.sub('', ln)   # strip ( ... ) comments first
+        m = _G154_RE.search(s)
         if m:
-            op1_p = int(m.group(1))
+            op1_p     = int(m.group(1))
             op1_p_hit = i
-            break
+            # don't break — keep scanning to get the LAST G154 in OP1
     _post_flip_start = (flip_idx + 1) if flip_idx is not None else len(lines)
     for i, ln in enumerate(post_flip):
-        m = _G154_RE.search(ln)
+        s = _INLINE_CMT_RE.sub('', ln)
+        m = _G154_RE.search(s)
         if m:
-            op2_p = int(m.group(1))
+            op2_p     = int(m.group(1))
             op2_p_hit = _post_flip_start + i
-            break
+            # don't break — keep scanning to get the LAST G154 in OP2
 
     # Detect G54/G55 usage when no G154 was found (mutually exclusive offset systems)
     uses_g5x = False
@@ -1614,11 +1668,19 @@ def verify_file(path: str, title: str, o_number: str = None) -> dict:
     # --- Expected values ---
     cb_mm = specs["cb_mm"]
 
-    # Exception 1: 116.7mm CB is physically cut as 116.9mm (+0.2 offset)
-    if abs(cb_mm - 116.7) < 0.001:
-        cb_expected_in = _to_in(_CB_116_7_ACTUAL_MM)
+    # Special-offset CBs: certain nominal mm values are physically cut at +0.2mm
+    # instead of the standard +0.1mm, and use a wider ±0.003" acceptance window.
+    _cb_special_actual = None
+    for _nom, _actual in _CB_SPECIAL_MM.items():
+        if abs(cb_mm - _nom) < 0.05:
+            _cb_special_actual = _actual
+            break
+    if _cb_special_actual is not None:
+        cb_expected_in = _to_in(_cb_special_actual)
+        _cb_tolerance  = _CB_SPECIAL_TOL_IN
     else:
         cb_expected_in = _to_in(cb_mm + 0.1)
+        _cb_tolerance  = TOLERANCE_IN
 
     # Exception 2: steel ring CB is anywhere from +0.1 to +0.4mm above title spec
     cb_expected_max_in = _to_in(cb_mm + 0.4) if specs.get("is_steel_ring") else None
@@ -1903,6 +1965,7 @@ def verify_file(path: str, title: str, o_number: str = None) -> dict:
         "ob_found_in":         ob_found_in,
         "cb_expected_in":      cb_expected_in,
         "cb_expected_max_in":  cb_expected_max_in,
+        "cb_tolerance_in":     _cb_tolerance,       # ±0.001" normal, ±0.003" for special offsets
         "ob_expected_in":      ob_expected_in,
         "step_expected_in":    step_expected_in,
         "cb_context":          context(cb_hit_line),
@@ -1947,12 +2010,16 @@ def verify_file(path: str, title: str, o_number: str = None) -> dict:
         "rb_pass_zs":          _rb["rb_pass_zs"],
         "rb_pass_lns":         _rb["rb_pass_lns"],
         "rb_start_ok":         _rb["rb_start_ok"],
+        "rb_pass_fs":          _rb["rb_pass_fs"],
         "rb_steps_ok":         _rb["rb_steps_ok"],
         "rb_max_step":         _rb["rb_max_step"],
         "rb_violations":       _rb["rb_violations"],
         "rb_skip_cb":          _rb["rb_skip_cb"],
         "rb_deep_ok":          _rb["rb_deep_ok"],
         "rb_deep_violations":  _rb["rb_deep_violations"],
+        "rb_rough_f_ok":       _rb["rb_rough_f_ok"],
+        "rb_finish_f_ok":      _rb["rb_finish_f_ok"],
+        "rb_finish_f_found":   _rb["rb_finish_f_found"],
         # OD turn-down
         "od_expected":         od_expected,
         "od_op1_found":        od_op1_found,
@@ -2009,7 +2076,8 @@ def verify_file(path: str, title: str, o_number: str = None) -> dict:
                 cb_found_in <= cb_expected_max_in + TOLERANCE_IN
             )
         else:
-            result["cb_ok"] = abs(diff) <= TOLERANCE_IN
+            # Use _cb_tolerance (wider for special-offset values like 116.7mm / 125mm)
+            result["cb_ok"] = abs(diff) <= _cb_tolerance
 
     if cb2_found_in is not None:
         # For STEP parts: cb2 is the center bore — check against step_expected_in.

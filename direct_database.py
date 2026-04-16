@@ -15,7 +15,7 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 def get_connection(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=10)   # retry for up to 10s if locked
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -97,6 +97,26 @@ def init_schema(db_path: str):
                 created_at  TEXT NOT NULL           -- ISO timestamp
             );
 
+            CREATE INDEX IF NOT EXISTS idx_revisions_file ON file_revisions(file_id);
+
+            CREATE TABLE IF NOT EXISTS bug_reports (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at      TEXT NOT NULL,
+                title           TEXT NOT NULL,
+                description     TEXT NOT NULL DEFAULT '',
+                steps           TEXT NOT NULL DEFAULT '',
+                severity        TEXT NOT NULL DEFAULT 'normal',
+                                -- low | normal | high | crash
+                status          TEXT NOT NULL DEFAULT 'open',
+                                -- open | in_progress | fixed | wontfix
+                error_log       TEXT DEFAULT '',   -- auto-attached recent errors
+                app_version     TEXT DEFAULT '',
+                resolved_in     TEXT DEFAULT '',   -- version where fix shipped
+                dev_notes       TEXT DEFAULT ''    -- developer response/notes
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_bug_status ON bug_reports(status);
+            CREATE INDEX IF NOT EXISTS idx_bug_created ON bug_reports(created_at);
             CREATE INDEX IF NOT EXISTS idx_revisions_file ON file_revisions(file_id);
             CREATE INDEX IF NOT EXISTS idx_files_o_number ON files(o_number);
             CREATE INDEX IF NOT EXISTS idx_files_hash     ON files(file_hash);
@@ -438,7 +458,7 @@ def clear_all_files(db_path: str):
     conn = get_connection(db_path)
     with conn:
         # Use CREATE TABLE IF NOT EXISTS indirectly by just ignoring missing tables
-        for table in ("group_members", "duplicate_groups", "files"):
+        for table in ("dup_group_members", "dup_groups", "files"):
             try:
                 conn.execute(f"DELETE FROM {table}")
             except Exception:
@@ -815,11 +835,15 @@ def delete_trash_files(db_path: str) -> tuple[int, int]:
 
     with conn:
         for fid in ids_to_purge:
-            # NULL out any dup_group recommended_id refs to avoid FK violation
+            # Clean all FK-referencing rows first — explicit deletes are safe
+            # regardless of whether ON DELETE CASCADE was present when the table was created
             conn.execute(
-                "UPDATE dup_groups SET recommended_id=NULL WHERE recommended_id=?", (fid,)
-            )
+                "UPDATE dup_groups SET recommended_id=NULL WHERE recommended_id=?", (fid,))
             conn.execute("DELETE FROM dup_group_members WHERE file_id=?", (fid,))
+            try:
+                conn.execute("DELETE FROM file_revisions WHERE file_id=?", (fid,))
+            except Exception:
+                pass  # table may not exist in older DBs
             conn.execute("DELETE FROM files WHERE id=?", (fid,))
 
         # Remove dup_groups that now have 0 or 1 members
@@ -844,4 +868,60 @@ def delete_trash_files(db_path: str) -> tuple[int, int]:
 
     conn.close()
     return deleted, missing
+
+
+# ---------------------------------------------------------------------------
+# Bug reports
+# ---------------------------------------------------------------------------
+
+def submit_bug_report(db_path: str, title: str, description: str,
+                      steps: str, severity: str, error_log: str,
+                      app_version: str = "") -> int:
+    """Insert a new bug report. Returns new row id."""
+    import datetime
+    conn = get_connection(db_path)
+    with conn:
+        cur = conn.execute("""
+            INSERT INTO bug_reports
+                (created_at, title, description, steps, severity,
+                 status, error_log, app_version)
+            VALUES (?, ?, ?, ?, ?, 'open', ?, ?)
+        """, (datetime.datetime.now().isoformat(),
+              title, description, steps, severity, error_log, app_version))
+        row_id = cur.lastrowid
+    conn.close()
+    return row_id
+
+
+def get_bug_reports(db_path: str, status: str | None = None) -> list:
+    """Return all bug reports, optionally filtered by status."""
+    conn = get_connection(db_path)
+    if status:
+        rows = conn.execute(
+            "SELECT * FROM bug_reports WHERE status=? ORDER BY created_at DESC",
+            (status,)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM bug_reports ORDER BY created_at DESC").fetchall()
+    conn.close()
+    return rows
+
+
+def update_bug_status(db_path: str, bug_id: int, status: str,
+                      dev_notes: str = "", resolved_in: str = ""):
+    conn = get_connection(db_path)
+    with conn:
+        conn.execute("""
+            UPDATE bug_reports
+            SET status=?, dev_notes=?, resolved_in=?
+            WHERE id=?
+        """, (status, dev_notes, resolved_in, bug_id))
+    conn.close()
+
+
+def delete_bug_report(db_path: str, bug_id: int):
+    conn = get_connection(db_path)
+    with conn:
+        conn.execute("DELETE FROM bug_reports WHERE id=?", (bug_id,))
+    conn.close()
 

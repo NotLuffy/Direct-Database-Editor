@@ -18,7 +18,7 @@ from PyQt6.QtCore import pyqtSignal
 _STATUSES = ["All", "active", "flagged", "review", "delete"]
 
 _PART_TYPES = ["All", "Standard", "HC — any", "HC — 15MM",
-               "2PC", "LUG", "STUD", "STEP", "SPACER", "Steel Ring"]
+               "2PC", "2PC HC", "LUG", "STUD", "STEP", "SPACER", "Steel Ring"]
 
 _SCORE_OPTIONS = [
     ("All",    None,  None),

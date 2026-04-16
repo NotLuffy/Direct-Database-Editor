@@ -10,12 +10,37 @@ import os
 import logging
 import threading
 import faulthandler
+from collections import deque
 
 
 def get_exe_dir() -> str:
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
+
+
+# ---------------------------------------------------------------------------
+# In-memory error buffer — last 50 ERROR/CRITICAL entries for bug reports
+# ---------------------------------------------------------------------------
+
+class _ErrorBuffer(logging.Handler):
+    """Keeps the last N error/critical log records in memory."""
+    def __init__(self, maxlen: int = 50):
+        super().__init__(level=logging.ERROR)
+        self._buf: deque[str] = deque(maxlen=maxlen)
+
+    def emit(self, record: logging.LogRecord):
+        self._buf.append(self.format(record))
+
+    def get_recent(self) -> str:
+        return "\n".join(self._buf) if self._buf else ""
+
+    def clear(self):
+        self._buf.clear()
+
+
+# Module-level singleton — imported by bug report dialog
+error_buffer = _ErrorBuffer()
 
 
 def setup_logging(exe_dir: str):
@@ -26,6 +51,11 @@ def setup_logging(exe_dir: str):
         format="%(asctime)s  %(levelname)s  %(message)s",
         encoding="utf-8",
     )
+
+    # Attach in-memory buffer to root logger
+    error_buffer.setFormatter(
+        logging.Formatter("%(asctime)s  %(levelname)s  %(message)s"))
+    logging.getLogger().addHandler(error_buffer)
 
     def handle_exception(exc_type, exc_value, exc_tb):
         if issubclass(exc_type, KeyboardInterrupt):

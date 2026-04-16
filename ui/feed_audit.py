@@ -59,7 +59,7 @@ class _AuditWorker(QThread):
                 break
             self.progress.emit(i + 1, total)
 
-            path = rec.get("file_path", "")
+            path = rec["file_path"] if rec["file_path"] else ""
             if not path or not os.path.isfile(path):
                 continue
 
@@ -87,8 +87,8 @@ class _AuditWorker(QThread):
                     if val < self.f_min or val > self.f_max:
                         direction = "Too Low" if val < self.f_min else "Too High"
                         self.violation.emit({
-                            "o_number":  rec.get("o_number", ""),
-                            "file_name": rec.get("file_name", ""),
+                            "o_number":  rec["o_number"] or "",
+                            "file_name": rec["file_name"] or "",
                             "file_path": path,
                             "line_no":   line_no,
                             "f_value":   val,
@@ -286,7 +286,7 @@ class FeedAuditDialog(QDialog):
             return [f for f in all_files if f["id"] in id_set]
         # Exclude deleted/trash
         return [f for f in all_files
-                if f.get("status") not in ("delete", "trash")]
+                if f["status"] not in ("delete", "trash")]
 
     def _run_audit(self):
         if self._worker and self._worker.isRunning():

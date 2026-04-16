@@ -124,10 +124,21 @@ def _part_type(title: str, vstatus: str = "") -> str:
 
     # 2PC with hub detection
     if re.search(r'-*2\s*PC\b', title, _PT):
-        # Check title for HC keyword
+        # Check title for HC keyword (explicit — trust the title)
         hub_in_title = _has_hub(title)
-        # Check verify_status for implicit hub token (IH:N.NNN")
-        hub_in_vstatus = bool(re.search(r'\bIH:\d+\.\d+', vstatus))
+        # Check verify_status for implicit hub token (IH:N.NNN").
+        # Only classify as "2PC HC" when BOTH:
+        #   1. IH ≥ 0.40" — true 0.50" HC hub (not small 0.22" mating hub)
+        #   2. RC: token present — the 0.30" recess was also cut on OP1
+        # A program with IH ≈ 0.22" is a regular 2PC mating hub, not a 2PC HC.
+        hub_in_vstatus = False
+        ih_m = re.search(r'\bIH:(\d+\.\d+)"?', vstatus)
+        if ih_m:
+            ih_val = float(ih_m.group(1))
+            has_rc = bool(re.search(r'\bRC:\d+\.\d+', vstatus))
+            # True 2PC HC: hub ≥ 0.40" (≈ standard 0.50" HC) AND recess detected
+            if ih_val >= 0.40 and has_rc:
+                hub_in_vstatus = True
         if hub_in_title or hub_in_vstatus:
             return "2PC HC"
         return "2PC"

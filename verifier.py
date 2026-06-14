@@ -306,6 +306,11 @@ _TURNING_Z_TABLE = {
     4.00:   -2.05,
 }
 TZ_TOLERANCE = 0.03   # ±0.03" tolerance on turning Z-depth limit
+# Absolute deepest any SINGLE turning side may plunge.  Used by the secondary
+# (asymmetric two-sided) acceptance path for thick parts the balanced table can't
+# reach — e.g. a 6.0" part turned −3.25" from one side and −2.85" from the other.
+# Distinct from the drilling max-pass cap (_DR_MAX_PASS = 4.15").  See TZ_SPEC.md.
+TZ_SIDE_CAP = 3.25
 
 # For the settings UI: store original hardcoded values
 _DEFAULTS = {
@@ -313,6 +318,7 @@ _DEFAULTS = {
     "DR_TOLERANCE_IN": DR_TOLERANCE_IN,
     "OD_TOLERANCE_IN": OD_TOLERANCE_IN,
     "TZ_TOLERANCE": TZ_TOLERANCE,
+    "TZ_SIDE_CAP": TZ_SIDE_CAP,
     "_F_MAX": 0.02,
     "_CB_F_MAX": 0.015,
 }
@@ -334,7 +340,7 @@ def apply_overrides(overrides: dict):
     Args:
         overrides: Dict with keys like "TOLERANCE_IN", "TZ_0.3937", "OD_5.75"
     """
-    global TOLERANCE_IN, DR_TOLERANCE_IN, OD_TOLERANCE_IN, TZ_TOLERANCE, _F_MAX, _CB_F_MAX
+    global TOLERANCE_IN, DR_TOLERANCE_IN, OD_TOLERANCE_IN, TZ_TOLERANCE, TZ_SIDE_CAP, _F_MAX, _CB_F_MAX
     global _TURNING_Z_TABLE, _OD_TABLE
 
     if not overrides:
@@ -345,6 +351,7 @@ def apply_overrides(overrides: dict):
     if "DR_TOLERANCE_IN" in overrides: DR_TOLERANCE_IN = float(overrides["DR_TOLERANCE_IN"])
     if "OD_TOLERANCE_IN" in overrides: OD_TOLERANCE_IN = float(overrides["OD_TOLERANCE_IN"])
     if "TZ_TOLERANCE"    in overrides: TZ_TOLERANCE    = float(overrides["TZ_TOLERANCE"])
+    if "TZ_SIDE_CAP"     in overrides: TZ_SIDE_CAP     = float(overrides["TZ_SIDE_CAP"])
     if "_F_MAX"          in overrides: _F_MAX          = float(overrides["_F_MAX"])
     if "_CB_F_MAX"       in overrides: _CB_F_MAX       = float(overrides["_CB_F_MAX"])
 
@@ -2006,35 +2013,53 @@ def verify_file(path: str, title: str, o_number: str = None) -> dict:
     _tz_thickness = total_thickness if total_thickness else disc_thickness
     if _tz_thickness is not None:
         tz_limit = _turning_z_limit(_tz_thickness)
-    if tz_limit is not None:
-        _tz_any_found = tz_op1_z is not None or tz_op2_z is not None
-        if _tz_any_found:
-            # Check each side against table limit
+    # Two acceptance paths (see TZ_SPEC.md):
+    #   Primary  — balanced split: each side within the table limit (normal parts).
+    #   Secondary — asymmetric two-sided split, used when the primary path fails OR the
+    #     table has no entry (thick parts > 4"): neither side past the −3.25" cap AND
+    #     OP1+OP2 together cover the full thickness (with overlap).  Requires BOTH sides.
+    _tz_any_found = tz_op1_z is not None or tz_op2_z is not None
+    if _tz_any_found and _tz_thickness is not None:
+        _tz_notes = []
+        # Primary: per-side table limit
+        primary_op1 = primary_op2 = None
+        if tz_limit is not None:
             if tz_op1_z is not None:
-                tz_op1_ok = tz_op1_z >= tz_limit - TZ_TOLERANCE
+                primary_op1 = tz_op1_z >= tz_limit - TZ_TOLERANCE
             if tz_op2_z is not None:
-                tz_op2_ok = tz_op2_z >= tz_limit - TZ_TOLERANCE
-            # 0.75× rule: neither side deeper than 75% of total thickness (under 4")
-            _tz_notes = []
-            if total_thickness and total_thickness < 4.0:
-                _tz_75_limit = -(0.75 * total_thickness)
-                if tz_op1_z is not None and tz_op1_z < _tz_75_limit - TZ_TOLERANCE:
-                    tz_op1_ok = False
-                    _tz_notes.append(f"OP1 Z{tz_op1_z:.4f} exceeds 75% of total ({_tz_75_limit:.4f})")
-                if tz_op2_z is not None and tz_op2_z < _tz_75_limit - TZ_TOLERANCE:
-                    tz_op2_ok = False
-                    _tz_notes.append(f"OP2 Z{tz_op2_z:.4f} exceeds 75% of total ({_tz_75_limit:.4f})")
-            # Hard cap: no side deeper than -4.15"
-            if tz_op1_z is not None and tz_op1_z < -4.15:
-                tz_op1_ok = False
-                _tz_notes.append(f"OP1 Z{tz_op1_z:.4f} exceeds hard cap Z-4.15")
-            if tz_op2_z is not None and tz_op2_z < -4.15:
-                tz_op2_ok = False
-                _tz_notes.append(f"OP2 Z{tz_op2_z:.4f} exceeds hard cap Z-4.15")
-            tz_note = "  ".join(_tz_notes) if _tz_notes else None
-            # Overall result
-            _tz_fail = tz_op1_ok is False or tz_op2_ok is False
-            tz_ok = not _tz_fail
+                primary_op2 = tz_op2_z >= tz_limit - TZ_TOLERANCE
+        _primary_fail = primary_op1 is False or primary_op2 is False
+        _primary_pass = tz_limit is not None and not _primary_fail
+
+        if _primary_pass:
+            tz_op1_ok, tz_op2_ok = primary_op1, primary_op2
+            tz_ok = True
+        else:
+            # Secondary path — needs both OP1 and OP2 turning present
+            d1 = abs(tz_op1_z) if tz_op1_z is not None else None
+            d2 = abs(tz_op2_z) if tz_op2_z is not None else None
+            if d1 is not None and d2 is not None:
+                deepest     = max(d1, d2)
+                cap_ok      = deepest <= TZ_SIDE_CAP + TZ_TOLERANCE
+                coverage_ok = (d1 + d2) >= _tz_thickness - TZ_TOLERANCE
+                tz_ok = cap_ok and coverage_ok
+                tz_op1_ok = tz_op2_ok = tz_ok
+                if not cap_ok:
+                    _tz_notes.append(
+                        f"side Z-{deepest:.3f} exceeds turning cap Z-{TZ_SIDE_CAP:.2f}")
+                if not coverage_ok:
+                    _tz_notes.append(
+                        f"OP1+OP2 cover {d1 + d2:.3f}\" < part {_tz_thickness:.3f}\""
+                        " (uncut middle band)")
+            elif tz_limit is not None and _primary_fail:
+                # Single side exceeds the table and there is no opposing OP to share depth
+                tz_op1_ok, tz_op2_ok = primary_op1, primary_op2
+                tz_ok = False
+                _tz_notes.append(
+                    "single-side turn exceeds table limit (no opposing OP to share depth)")
+            else:
+                tz_ok = None   # no table entry and only one side found → cannot judge (NF)
+        tz_note = "  ".join(_tz_notes) if _tz_notes else None
 
     # --- P-code verification (lathe determined by round size, thickness = total) ---
     pcode_ok       = None

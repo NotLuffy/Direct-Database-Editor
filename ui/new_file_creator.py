@@ -45,6 +45,21 @@ _ROUND_TO_O_RANGE = [
     (13.00, 13000, 13999),
 ]
 
+# Maps each round size to the subfolder name used by Export Files
+_RS_TO_FOLDER = {
+    5.75:  "5.75in",
+    6.00:  "6.00in",
+    6.25:  "6.25in",
+    6.50:  "6.50in",
+    7.00:  "7.00in",
+    7.50:  "7.50in",
+    8.00:  "8.00in",
+    8.50:  "8.50in",
+    9.50:  "9.50in",
+    10.25: "10.25-10.50in",
+    13.00: "13.00in",
+}
+
 _O_RE = re.compile(r'^O(\d{4,6})$', re.IGNORECASE)
 
 _FREE_CAP = 200   # max free O-numbers shown in dropdown
@@ -334,7 +349,7 @@ class NewFileCreatorDialog(QDialog):
         color = "#ff6666" if has_fail else "#44dd88"
         self._verify_lbl.setStyleSheet(f"color:{color}; font-size:11px;")
         self._verify_lbl.setText(
-            f"Score: {score}/7    {vstatus or '(no status)'}")
+            f"Score: {score}/8    {vstatus or '(no status)'}")
         self._verified = True
         self._save_btn.setEnabled(True)
 
@@ -350,12 +365,20 @@ class NewFileCreatorDialog(QDialog):
                                 f"'{onum}' is not a valid O-number.")
             return
 
-        # Target folder
-        folder = self._folder_combo.currentData()
-        if not folder or not os.path.isdir(folder):
+        # Target folder — save into the round-size subfolder
+        top_folder = self._folder_combo.currentData()
+        if not top_folder or not os.path.isdir(top_folder):
             QMessageBox.warning(self, "No Folder",
                                 "Select a valid target folder.")
             return
+
+        rs, _, _ = self._current_range()
+        rs_subfolder = _RS_TO_FOLDER.get(rs)
+        if rs_subfolder:
+            folder = os.path.join(top_folder, rs_subfolder)
+            os.makedirs(folder, exist_ok=True)
+        else:
+            folder = top_folder
 
         # Check for existing file on disk
         file_path = os.path.join(folder, onum)
@@ -421,7 +444,7 @@ class NewFileCreatorDialog(QDialog):
             "line_count":        line_count,
             "program_title":     title,
             "derived_from":      "",
-            "source_folder":     folder,
+            "source_folder":     top_folder,
             "status":            "active",
             "verify_status":     vstatus,
             "verify_score":      score,
@@ -442,9 +465,9 @@ class NewFileCreatorDialog(QDialog):
             QMessageBox.critical(self, "Database Error", str(exc))
             return
 
-        self.file_created.emit(file_path)
         QMessageBox.information(
             self, "File Created",
-            f"{onum} saved to:\n{file_path}\n\nScore: {score}/7"
+            f"{onum} saved to:\n{file_path}\n\nScore: {score}/8"
         )
         self.accept()
+        self.file_created.emit(file_path)

@@ -7,6 +7,7 @@ All state is stored here: file index, duplicate groups, scan log, settings.
 
 import sqlite3
 import os
+import logging
 from typing import Optional
 
 
@@ -20,6 +21,23 @@ def get_connection(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+def checkpoint_and_close(db_path: str):
+    """
+    Checkpoint the WAL file back into the main DB and close.
+    Called on app exit so Google Drive only has one file to sync.
+    Safe to call even if the DB is not in WAL mode or doesn't exist.
+    """
+    if not os.path.exists(db_path):
+        return
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.close()
+        logging.info("WAL checkpoint on close: %s", db_path)
+    except Exception:
+        logging.warning("Could not checkpoint WAL on close for %s", db_path, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -45,7 +63,7 @@ def init_schema(db_path: str):
                 status          TEXT NOT NULL DEFAULT 'active',
                                                          -- active | flagged | review | delete
                 verify_status   TEXT DEFAULT '',
-                verify_score    INTEGER DEFAULT 0,       -- count of PASS tokens 0-6
+                verify_score    INTEGER DEFAULT 0,       -- count of PASS tokens 0-8
                 has_dup_flag    INTEGER NOT NULL DEFAULT 0,
                 notes           TEXT DEFAULT '',
                 last_seen       TEXT,                    -- ISO timestamp of last scan
@@ -154,6 +172,128 @@ def init_schema(db_path: str):
             conn.execute(
                 "INSERT OR IGNORE INTO app_settings (key, value) VALUES (?, ?)", (k, v))
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Cross-machine path remapping (Google Drive / network sync)
+# ---------------------------------------------------------------------------
+
+def remap_paths_if_needed(db_path: str) -> bool:
+    """
+    When a DB is opened on a machine whose Google Drive root differs from the
+    machine that last wrote the DB, all stored file_path / source_folder values
+    will point to the wrong drive letter or user profile path.
+
+    This function detects that situation by comparing the stored paths' common
+    root against the directory that contains the DB file (which IS the project
+    root, because the DB always lives at <root>/condenser_direct.db).
+
+    If a mismatch is found it does a single bulk UPDATE — no files are touched,
+    only the DB records.  Returns True if a remap was performed.
+    """
+    current_root = os.path.normpath(os.path.dirname(os.path.abspath(db_path)))
+    conn = get_connection(db_path)
+
+    # Sample a few stored paths to find the old root
+    rows = conn.execute(
+        "SELECT file_path FROM files WHERE file_path != '' LIMIT 200"
+    ).fetchall()
+
+    if not rows:
+        conn.close()
+        return False
+
+    stored_paths = [os.path.normpath(r["file_path"]) for r in rows]
+
+    # Fast check: if any path already starts with current_root, no remap needed
+    if stored_paths[0].startswith(current_root):
+        conn.close()
+        return False
+
+    # Find old root from the common prefix of stored paths
+    old_root = os.path.commonprefix(stored_paths)
+    # commonprefix is char-level; back up to a real directory boundary
+    if not os.path.isdir(old_root):
+        old_root = os.path.dirname(old_root)
+    old_root = os.path.normpath(old_root)
+
+    if old_root == current_root:
+        conn.close()
+        return False
+
+    old_prefix = old_root + os.sep
+    new_prefix = current_root + os.sep
+    prefix_len = len(old_prefix)
+
+    logging.info("Remapping DB paths: %s → %s", old_root, current_root)
+
+    with conn:
+        # The stale rows we are about to delete may be referenced by
+        # dup_groups.recommended_id, whose FK has no ON DELETE CASCADE (unlike
+        # dup_group_members / file_revisions).  With PRAGMA foreign_keys=ON the
+        # DELETE below would raise "FOREIGN KEY constraint failed", so clear those
+        # dangling references first.
+        conn.execute("""
+            UPDATE dup_groups SET recommended_id = NULL
+            WHERE recommended_id IN (
+                SELECT id FROM files
+                WHERE SUBSTR(file_path, 1, ?) = ?
+                  AND (? || SUBSTR(file_path, ?)) IN (SELECT file_path FROM files)
+            )
+        """, (prefix_len, old_prefix, new_prefix, prefix_len + 1))
+
+        # Remove stale old-prefix rows whose remapped path already exists in the DB.
+        # This happens when both computers independently scanned and stored paths under
+        # different drive letters for the same physical files.
+        conn.execute("""
+            DELETE FROM files
+            WHERE SUBSTR(file_path, 1, ?) = ?
+              AND (? || SUBSTR(file_path, ?)) IN (SELECT file_path FROM files)
+        """, (prefix_len, old_prefix, new_prefix, prefix_len + 1))
+
+        # Remap remaining old-prefix file_path rows
+        conn.execute("""
+            UPDATE files
+            SET file_path = ? || SUBSTR(file_path, ?)
+            WHERE SUBSTR(file_path, 1, ?) = ?
+        """, (new_prefix, prefix_len + 1, prefix_len, old_prefix))
+
+        # Remap source_folder
+        conn.execute("""
+            UPDATE files
+            SET source_folder = ? || SUBSTR(source_folder, ?)
+            WHERE SUBSTR(source_folder, 1, ?) = ?
+        """, (new_prefix, prefix_len + 1, prefix_len, old_prefix))
+
+        # Remap last_scan_folders setting (semicolon-separated list)
+        row = conn.execute(
+            "SELECT value FROM app_settings WHERE key='last_scan_folders'"
+        ).fetchone()
+        if row and row["value"]:
+            new_folders = ";".join(
+                new_prefix + f[prefix_len:]
+                if f.startswith(old_prefix) else f
+                for f in row["value"].split(";")
+                if f
+            )
+            conn.execute(
+                "UPDATE app_settings SET value=? WHERE key='last_scan_folders'",
+                (new_folders,)
+            )
+
+        # Remap backup_folder setting
+        row2 = conn.execute(
+            "SELECT value FROM app_settings WHERE key='backup_folder'"
+        ).fetchone()
+        if row2 and row2["value"] and row2["value"].startswith(old_prefix):
+            conn.execute(
+                "UPDATE app_settings SET value=? WHERE key='backup_folder'",
+                (new_prefix + row2["value"][prefix_len:],)
+            )
+
+    conn.close()
+    logging.info("Path remap complete")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -508,7 +648,7 @@ def get_status_counts(db_path: str, scope_folders: list | None = None) -> dict:
 
 
 def get_score_counts(db_path: str, scope_folders: list | None = None) -> dict:
-    """Return counts bucketed: perfect(7), good(5-6), fair(3-4), poor(0-2)."""
+    """Return counts bucketed: perfect(8), good(6-7), fair(4-5), poor(0-3)."""
     scope_sql, scope_params = _scope_clause(scope_folders)
     where = f"WHERE {scope_sql}" if scope_sql else ""
 
@@ -518,13 +658,13 @@ def get_score_counts(db_path: str, scope_folders: list | None = None) -> dict:
         scope_params
     ).fetchall()
     conn.close()
-    buckets = {"7": 0, "5-6": 0, "3-4": 0, "0-2": 0}
+    buckets = {"8": 0, "6-7": 0, "4-5": 0, "0-3": 0}
     for r in rows:
         s = r["verify_score"]
-        if s == 7:            buckets["7"]   += r["n"]
-        elif s in (5, 6):     buckets["5-6"] += r["n"]
-        elif s in (3, 4):     buckets["3-4"] += r["n"]
-        else:                 buckets["0-2"] += r["n"]
+        if s >= 8:            buckets["8"]   += r["n"]
+        elif s in (6, 7):     buckets["6-7"] += r["n"]
+        elif s in (4, 5):     buckets["4-5"] += r["n"]
+        else:                 buckets["0-3"] += r["n"]
     return buckets
 
 

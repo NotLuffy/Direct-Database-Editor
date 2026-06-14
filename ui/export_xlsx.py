@@ -20,7 +20,7 @@ from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 import direct_database as db
-from direct_models import _part_type
+from direct_models import _part_type, _is_2pc
 from verifier import parse_title_specs
 
 # ---------------------------------------------------------------------------
@@ -51,12 +51,33 @@ _HEADERS = [
     "Thickness",
     "Hub",
     "Type",
+    # New indicator columns (appended before Notes)
+    "Counterbore (mm)",
+    "Step Depth",
+    "RC (in)",
+    "HB (in)",
+    "IH (in)",
     "Notes",
     "Verify Status",
     "Fails",
 ]
 
-_COL_WIDTHS = [12, 44, 12, 10, 10, 12, 10, 12, 32, 38, 26]
+_COL_WIDTHS = [12, 44, 12, 10, 10, 12, 10, 12, 15, 11, 10, 10, 10, 32, 38, 26]
+
+# ── Focused tab layouts ───────────────────────────────────────────────────────
+_2PC_HEADERS = ["O-Number", "Title", "Round Size", "Type", "CB (mm)", "OB (mm)",
+                "RC (in)", "HB (in)", "IH (in)", "Thickness",
+                "Verify Status", "Fails"]
+_2PC_WIDTHS  = [12, 44, 12, 12, 10, 10, 10, 10, 10, 12, 38, 26]
+_2PC_KEYS    = ["o_number", "title", "rs_disp", "type", "cb", "ob",
+                "rc", "hb", "ih", "thickness", "verify", "fails"]
+
+_STEP_HEADERS = ["O-Number", "Title", "Round Size", "Type", "CB (mm)",
+                 "Counterbore (mm)", "Step Depth", "Thickness",
+                 "Verify Status", "Fails"]
+_STEP_WIDTHS  = [12, 44, 12, 12, 10, 15, 11, 12, 38, 26]
+_STEP_KEYS    = ["o_number", "title", "rs_disp", "type", "cb", "counterbore",
+                 "step_depth", "thickness", "verify", "fails"]
 
 # ---------------------------------------------------------------------------
 # Palette  (light / standard Excel look)
@@ -107,6 +128,27 @@ def _fails(vstatus: str) -> str:
     if not vstatus:
         return ""
     return " ".join(t for t in vstatus.split() if t.upper().endswith(":FAIL"))
+
+
+_TOKEN_PATS = {
+    "rc":   re.compile(r'\bRC:(\d+(?:\.\d+)?)'),
+    "hb":   re.compile(r'\bHB:(\d+(?:\.\d+)?)'),
+    "ih":   re.compile(r'\bIH:(\d+(?:\.\d+)?)'),
+    "step": re.compile(r'\bSTEP:(\d+(?:\.\d+)?)'),   # counterbore mm
+    "sd":   re.compile(r'\bSD:(\d+(?:\.\d+)?)'),      # step depth in
+}
+
+
+def _tokens(vstatus: str) -> dict:
+    """Pull RC/HB/IH/STEP/SD numeric values from a verify_status string."""
+    out: dict = {}
+    if not vstatus:
+        return out
+    for key, pat in _TOKEN_PATS.items():
+        m = pat.search(vstatus)
+        if m:
+            out[key] = float(m.group(1))
+    return out
 
 
 def _o_int(o_number: str) -> int:
@@ -180,28 +222,51 @@ def _build_row(rec) -> dict:
     hc_in  = sp.get("hc_height_in")
 
     vstatus = rec["verify_status"] or ""
+    tk      = _tokens(vstatus)
 
-    th_disp = f"{th_in * 25.4:.1f}MM" if th_in is not None else "N/A"
+    # Counterbore: prefer the title's step_mm, else the geometry STEP: token
+    cbore_mm = sp.get("step_mm")
+    if cbore_mm is None:
+        cbore_mm = tk.get("step")
+    step_depth = tk.get("sd")
+    rc_in, hb_in, ih_in = tk.get("rc"), tk.get("hb"), tk.get("ih")
+
+    if th_in is None:
+        th_disp = "N/A"
+    elif sp.get("length_from_mm"):
+        mm_val = th_in * 25.4
+        th_disp = f"{round(mm_val):.0f}MM" if abs(mm_val - round(mm_val)) < 0.1 else f"{mm_val:.1f}MM"
+    else:
+        th_disp = f'{th_in:.3f}"'
 
     return {
         # Display columns (in header order)
-        "o_number":  rec["o_number"] or "",
-        "title":     title,
-        "rs_disp":   f'{rs_in:.2f}"' if rs_in else "N/A",
-        "cb":        _fmt_mm(cb_mm),
-        "ob":        _fmt_mm(ob_mm),         # N/A when ob_mm is None
-        "thickness": th_disp,
-        "hub":       _fmt_hub(hc_in),
-        "type":      ptype,
-        "notes":     (rec["notes"] or "").replace("\n", " ")[:200],
-        "verify":    vstatus,
-        "fails":     _fails(vstatus),
+        "o_number":    rec["o_number"] or "",
+        "title":       title,
+        "rs_disp":     f'{rs_in:.2f}"' if rs_in else "N/A",
+        "cb":          _fmt_mm(cb_mm),
+        "ob":          _fmt_mm(ob_mm),         # N/A when ob_mm is None
+        "thickness":   th_disp,
+        "hub":         _fmt_hub(hc_in),
+        "type":        ptype,
+        "counterbore": _fmt_mm(cbore_mm),
+        "step_depth":  _fmt_in(step_depth),
+        "rc":          _fmt_in(rc_in),
+        "hb":          _fmt_in(hb_in),
+        "ih":          _fmt_in(ih_in),
+        "notes":       (rec["notes"] or "").replace("\n", " ")[:200],
+        "verify":      vstatus,
+        "fails":       _fails(vstatus),
         # Sort/filter keys (not written to sheet)
         "_rs":   rs_in or 0.0,
         "_cb":   cb_mm if cb_mm is not None else 99999.0,
         "_th":   th_in if th_in is not None else 99999.0,
         "_type": ptype,
         "_onum": _o_int(rec["o_number"] or ""),
+        "_rc_val":    rc_in    if rc_in    is not None else 99999.0,
+        "_cbore_val": cbore_mm if cbore_mm is not None else 99999.0,
+        "_is2pc":  _is_2pc(title),
+        "_isstep": ptype == "STEP",
     }
 
 # ---------------------------------------------------------------------------
@@ -237,18 +302,20 @@ def _write_sheet(ws, used_rows: list[dict], free_onums: list[int],
     else:
         sorted_rows = sorted(used_rows, key=_sort_key)
 
+    fails_col = len(_HEADERS)   # Fails is always the last column
     row_i = 2
     for r in sorted_rows:
         vals = [
-            r["o_number"], r["title"],    r["rs_disp"],
-            r["cb"],       r["ob"],       r["thickness"],
-            r["hub"],      r["type"],     r["notes"],
-            r["verify"],   r["fails"],
+            r["o_number"],    r["title"],      r["rs_disp"],
+            r["cb"],          r["ob"],         r["thickness"],
+            r["hub"],         r["type"],
+            r["counterbore"], r["step_depth"], r["rc"], r["hb"], r["ih"],
+            r["notes"],       r["verify"],     r["fails"],
         ]
         for col_i, val in enumerate(vals, start=1):
             cell = ws.cell(row=row_i, column=col_i, value=val)
-            # Fails column (11) in bold red if non-empty
-            if col_i == 11 and val:
+            # Fails column in bold red if non-empty
+            if col_i == fails_col and val:
                 cell.font = _FAIL_FONT
             else:
                 cell.font = _ROW_FONT
@@ -272,6 +339,31 @@ def _write_sheet(ws, used_rows: list[dict], free_onums: list[int],
 
     # ── Autofilter + freeze ───────────────────────────────────────────────
     last_col = get_column_letter(len(_HEADERS))
+    ws.auto_filter.ref = f"A1:{last_col}{max(row_i - 1, 1)}"
+    ws.freeze_panes = "A2"
+
+
+def _write_focus_sheet(ws, headers: list[str], widths: list[int],
+                       rows: list[dict], val_keys: list[str]) -> None:
+    """Write a focused tab (2PC / STEP): header + rows, no FREE rows."""
+    for col_i, (hdr, width) in enumerate(zip(headers, widths), start=1):
+        cell = ws.cell(row=1, column=col_i, value=hdr)
+        cell.fill = _HDR_FILL
+        cell.font = _HDR_FONT
+        cell.alignment = _HDR_ALIGN
+        ws.column_dimensions[get_column_letter(col_i)].width = width
+    ws.row_dimensions[1].height = 18
+
+    fails_col = len(headers)   # Fails is the last column
+    row_i = 2
+    for r in rows:
+        for col_i, key in enumerate(val_keys, start=1):
+            val = r[key]
+            cell = ws.cell(row=row_i, column=col_i, value=val)
+            cell.font = _FAIL_FONT if (col_i == fails_col and val) else _ROW_FONT
+        row_i += 1
+
+    last_col = get_column_letter(len(headers))
     ws.auto_filter.ref = f"A1:{last_col}{max(row_i - 1, 1)}"
     ws.freeze_panes = "A2"
 
@@ -303,6 +395,25 @@ def export_workbook(db_path: str, out_path: str,
     ).fetchall()
     conn.close()
 
+    # Deduplicate by O-number: DB can have multiple file_paths per O-number.
+    # Prefer: row with verify_status > row with notes > first seen.
+    _seen: dict[str, object] = {}
+    for r in db_rows:
+        onum = r["o_number"] or ""
+        if not onum:
+            continue
+        if onum not in _seen:
+            _seen[onum] = r
+        else:
+            existing = _seen[onum]
+            has_vs = bool(r["verify_status"] or "")
+            ex_vs  = bool(existing["verify_status"] or "")
+            has_nt = bool(r["notes"] or "")
+            ex_nt  = bool(existing["notes"] or "")
+            if (has_vs and not ex_vs) or (has_nt and not ex_nt and not ex_vs):
+                _seen[onum] = r
+    db_rows = list(_seen.values())
+
     # Build enriched row dicts for every scanned file
     all_built: list[dict] = [_build_row(r) for r in db_rows]
 
@@ -327,6 +438,22 @@ def export_workbook(db_path: str, out_path: str,
     ws_all = wb.create_sheet(title="All")
     # All sheet: free_rs_label=None → looked up per O-number
     _write_sheet(ws_all, all_built, all_free, sort_by_onum=True)
+
+    # ── 2PC tab — 2PC programs only (sorted Round → CB → RC) ──────────────
+    twopc_rows = sorted(
+        (r for r in all_built if r["_is2pc"]),
+        key=lambda r: (r["_rs"], r["_cb"], r["_rc_val"]),
+    )
+    ws_2pc = wb.create_sheet(title="2PC")
+    _write_focus_sheet(ws_2pc, _2PC_HEADERS, _2PC_WIDTHS, twopc_rows, _2PC_KEYS)
+
+    # ── STEP tab — STEP programs only (sorted Round → CB → Counterbore) ───
+    step_rows = sorted(
+        (r for r in all_built if r["_isstep"]),
+        key=lambda r: (r["_rs"], r["_cb"], r["_cbore_val"]),
+    )
+    ws_step = wb.create_sheet(title="STEP")
+    _write_focus_sheet(ws_step, _STEP_HEADERS, _STEP_WIDTHS, step_rows, _STEP_KEYS)
 
     # ── Per-round-size sheets ─────────────────────────────────────────────
     for sheet_name, round_sizes, o_min, o_max in _ROUND_SHEETS:

@@ -16,3 +16,16 @@ dist/
 # IDE
 .vscode/
 .idea/
+
+# Build/release artifacts
+installer/
+release/
+Backups/
+*.zip
+*.exe
+
+# Generated/data files
+*.xlsx
+*.csv
+*.pdf
+_baseline.json

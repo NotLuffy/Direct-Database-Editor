@@ -17,6 +17,7 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QColor
 
 import verifier as _vfy
+from direct_scorer import _applicable_keys
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Background worker so the UI stays responsive while verifying
@@ -120,6 +121,7 @@ class VerifyPanel(QWidget):
         self.setStyleSheet("QWidget { background: #0d0e18; color: #ccccdd; }")
         self._worker: _VerifyWorker | None = None
         self._current_path = ""
+        self._current_title = ""
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -180,6 +182,7 @@ class VerifyPanel(QWidget):
             return   # already showing this file
 
         self._current_path = file_path
+        self._current_title = title
         self._hdr.setText(
             f"  Verifying  {os.path.basename(file_path)} …")
 
@@ -223,7 +226,7 @@ class VerifyPanel(QWidget):
   .desc { color: #aaaacc; }
 </style>
 
-<h2>Scored Checks (7 total &mdash; each adds 1 to score when PASS)</h2>
+<h2>Scored Checks (only the ones that apply to the part are scored &mdash; score is X / N)</h2>
 <table>
   <tr><th>Token</th><th>Name</th><th>What It Checks</th></tr>
   <tr>
@@ -232,13 +235,18 @@ class VerifyPanel(QWidget):
   </tr>
   <tr>
     <td class="tok">OB</td><td>Outer Bore</td>
-    <td class="desc">Second bore pass (HC/STEP/2PC hub bore) matches title OB spec &plusmn;0.5mm.
-    Standard parts with no OB show NF.</td>
+    <td class="desc">Second bore pass (HC/2PC hub bore) matches title OB spec &plusmn;0.5mm.
+    <b>Not applicable</b> to Standard or STEP parts (no outer bore) &mdash; omitted, not scored.</td>
   </tr>
   <tr>
     <td class="tok">DR</td><td>Drill Depth</td>
     <td class="desc">T101 drill (G81/G83) Z-depth matches -(total_thickness + 0.15").
     15MM HC always expects Z-1.15". Dual drills checked on sum.</td>
+  </tr>
+  <tr>
+    <td class="tok">RB</td><td>Rough Bore</td>
+    <td class="desc">T121 OP1 underbore passes: start diameter, step increments,
+    deepening order, and rough/finish feed rates.</td>
   </tr>
   <tr>
     <td class="tok">OD</td><td>OD Turn</td>
@@ -262,6 +270,29 @@ class VerifyPanel(QWidget):
     &le;2.50&quot; &rarr; Z-13 &nbsp;|&nbsp; 2.75&ndash;3.75&quot; &rarr; Z-11 &nbsp;|&nbsp;
     4.0&ndash;5.0&quot; &rarr; Z-9 &nbsp;|&nbsp; &gt;5.0&quot; &rarr; NF</td>
   </tr>
+  <tr>
+    <td class="tok">FE</td><td>Feed Rate</td>
+    <td class="desc">No G01/G02/G03 feed move may exceed F0.020 in/rev. Applies to all parts.</td>
+  </tr>
+  <tr>
+    <td class="tok">ZD</td><td>Z Depth Limit</td>
+    <td class="desc">No non-G53 line may cut below Z-4.15" (machine/fixture hard cap).</td>
+  </tr>
+  <tr>
+    <td class="tok">IC</td><td>Integer Coordinates</td>
+    <td class="desc">Every X/Z coordinate must include a decimal point (X3 &rarr; X3. ).
+    Z0 is exempt. Guards against 10&times; position errors.</td>
+  </tr>
+  <tr>
+    <td class="tok">CBORE</td><td>Counterbore (STEP)</td>
+    <td class="desc">STEP only. Detected counterbore cut = title counterbore + 0.1mm
+    (same rule as CB).</td>
+  </tr>
+  <tr>
+    <td class="tok">SDOK</td><td>Step Depth (STEP)</td>
+    <td class="desc">STEP only. Cut depth = the "(0.40 deep step)" comment value + 0.03".
+    No depth comment &rarr; NF (cannot verify).</td>
+  </tr>
 </table>
 
 <h2>Result Tokens</h2>
@@ -278,12 +309,14 @@ class VerifyPanel(QWidget):
       <td class="desc">Overridden to FAIL via right-click &rarr; Override Verify</td></tr>
 </table>
 
-<h2>2PC-Only Tokens (not scored)</h2>
+<h2>Detected Tokens (informational, not scored)</h2>
 <table>
   <tr><th>Token</th><th>Meaning</th></tr>
-  <tr><td class="tok">RC:&lt;val&gt;</td><td class="desc">Recess X diameter found in G-code (for Piece B pairing)</td></tr>
-  <tr><td class="tok">HB:&lt;val&gt;</td><td class="desc">Hub outside diameter found in G-code</td></tr>
-  <tr><td class="tok">IH:&lt;val&gt;</td><td class="desc">Implicit hub height inferred from G-code (not stated in title)</td></tr>
+  <tr><td class="tok">RC:&lt;val&gt;</td><td class="desc">2PC recess X diameter found in G-code (for Piece B pairing)</td></tr>
+  <tr><td class="tok">HB:&lt;val&gt;</td><td class="desc">2PC hub outside diameter found in G-code</td></tr>
+  <tr><td class="tok">IH:&lt;val&gt;</td><td class="desc">2PC implicit hub height inferred from G-code (not stated in title)</td></tr>
+  <tr><td class="tok">STEP:&lt;val&gt;</td><td class="desc">STEP counterbore diameter (mm) detected in G-code</td></tr>
+  <tr><td class="tok">SD:&lt;val&gt;</td><td class="desc">STEP depth (in) detected in G-code</td></tr>
 </table>
 """)
         lay.addWidget(browser)
@@ -316,8 +349,15 @@ class VerifyPanel(QWidget):
         ob_mm = specs.get("ob_mm")
         th    = result.get("total_thickness")
 
+        # Which checks actually apply to this part (same logic the scorer uses) —
+        # drives what is shown so the panel matches what's scored.
+        app_keys   = _applicable_keys(self._current_title, result)
+        applicable = set(app_keys)
+        n_app      = len(app_keys)
+        n_pass     = sum(1 for k in app_keys if result.get(k) is True)
+
         # ── Spec summary row ──────────────────────────────────────────────────
-        spec_parts = []
+        spec_parts = [f"Score {n_pass}/{n_app}"]
         if rs:   spec_parts.append(f"Round {rs}\"")
         if cb_mm: spec_parts.append(f"CB {cb_mm:.2f}mm")
         if ob_mm: spec_parts.append(f"OB {ob_mm:.2f}mm")
@@ -366,20 +406,23 @@ class VerifyPanel(QWidget):
         self._add_context(result.get("cb_context") or [],
                           result.get("cb_context_hit_ln"))
 
-        # ── OB ────────────────────────────────────────────────────────────────
-        ob_ok  = result.get("ob_ok")
-        txt, fg, bg = _ok_to_badge(ob_ok)
-        ob_badge = _badge(txt, fg, bg)
-        ob_found = result.get("ob_found_in")
-        ob_exp   = result.get("ob_expected_in")
-        ob_diff  = result.get("ob_diff_in")
-        ob_detail = (f"Found: {_inch(ob_found)}  ({_mm(ob_found)})"
-                     f"    Expected: {_inch(ob_exp)}  ({_mm(ob_exp)})")
-        if ob_diff is not None:
-            ob_detail += f"    Diff: {ob_diff:+.4f}\""
-        self._add_check_row("OB  (Outer Bore / Pilot)", ob_badge, ob_detail)
-        self._add_context(result.get("ob_context") or [],
-                          result.get("ob_context_hit_ln"))
+        # ── OB ──────────────────────────────────────────────────────────────
+        # Only shown when it applies (HC / 2PC hub parts). Standard & STEP parts
+        # have no outer bore, so OB is omitted entirely.
+        if "ob_ok" in applicable:
+            ob_ok  = result.get("ob_ok")
+            txt, fg, bg = _ok_to_badge(ob_ok)
+            ob_badge = _badge(txt, fg, bg)
+            ob_found = result.get("ob_found_in")
+            ob_exp   = result.get("ob_expected_in")
+            ob_diff  = result.get("ob_diff_in")
+            ob_detail = (f"Found: {_inch(ob_found)}  ({_mm(ob_found)})"
+                         f"    Expected: {_inch(ob_exp)}  ({_mm(ob_exp)})")
+            if ob_diff is not None:
+                ob_detail += f"    Diff: {ob_diff:+.4f}\""
+            self._add_check_row("OB  (Outer Bore / Pilot)", ob_badge, ob_detail)
+            self._add_context(result.get("ob_context") or [],
+                              result.get("ob_context_hit_ln"))
 
         # ── Drill ─────────────────────────────────────────────────────────────
         dr_ok   = result.get("dr_ok")
@@ -401,6 +444,33 @@ class VerifyPanel(QWidget):
         self._add_check_row("DR  (Drill Depth)", dr_badge, dr_detail)
         self._add_context(result.get("dr_context") or [],
                           result.get("dr_context_hit_ln"))
+
+        # ── RB (Rough Bore Passes) ────────────────────────────────────────────
+        if "rb_ok" in applicable:
+            rb_ok = result.get("rb_ok")
+            txt, fg, bg = _ok_to_badge(rb_ok)
+            rb_badge = _badge(txt, fg, bg)
+            _sub = []
+            for _nm, _v in (("start",  result.get("rb_start_ok")),
+                            ("steps",  result.get("rb_steps_ok")),
+                            ("deep",   result.get("rb_deep_ok")),
+                            ("roughF", result.get("rb_rough_f_ok")),
+                            ("finishF", result.get("rb_finish_f_ok"))):
+                if _v is True:
+                    _sub.append(f"{_nm}:OK")
+                elif _v is False:
+                    _sub.append(f"{_nm}:FAIL")
+            n_passes = len(result.get("rb_pass_xs") or [])
+            rb_detail = f"{n_passes} bore pass(es)"
+            max_step = result.get("rb_max_step")
+            if max_step is not None:
+                rb_detail += f'    Max step: {max_step:.3f}"'
+            if _sub:
+                rb_detail += "    " + "  ".join(_sub)
+            viol = result.get("rb_violations") or []
+            if viol:
+                rb_detail += f"    ⚠ {len(viol)} step violation(s)"
+            self._add_check_row("RB  (Rough Bore Passes)", rb_badge, rb_detail)
 
         # ── OD Turn ───────────────────────────────────────────────────────────
         od_ok    = result.get("od_ok")
@@ -477,6 +547,101 @@ class VerifyPanel(QWidget):
         self._add_check_row("HM  (Home Position G53)", hm_badge, hm_detail)
         self._add_context(result.get("home_context") or [],
                           result.get("home_context_hit_ln"))
+
+        # ── FE (Feed Rate) ────────────────────────────────────────────────────
+        if "fr_ok" in applicable:
+            txt, fg, bg = _ok_to_badge(result.get("fr_ok"))
+            fe_badge = _badge(txt, fg, bg)
+            fr_max  = result.get("fr_max")
+            fr_viol = result.get("fr_violations") or []
+            if fr_max:
+                fe_detail = f"Max feed: F{fr_max:.4f}    Limit: F{_vfy._F_MAX:.4f}"
+            else:
+                fe_detail = "No feed moves found"
+            if fr_viol:
+                fe_detail += f"    ⚠ {len(fr_viol)} move(s) over limit"
+            self._add_check_row("FE  (Feed Rate)", fe_badge, fe_detail)
+            hit = (fr_viol[0][0] + 1) if fr_viol else None
+            self._add_context(result.get("fr_context") or [], hit)
+
+        # ── ZD (Z Depth Limit) ────────────────────────────────────────────────
+        if "z_deep_ok" in applicable:
+            txt, fg, bg = _ok_to_badge(result.get("z_deep_ok"))
+            zd_badge = _badge(txt, fg, bg)
+            zd_viol = result.get("z_deep_violations") or []
+            if zd_viol:
+                zd_detail = (f"{len(zd_viol)} move(s) below Z-4.15\""
+                             f"    Deepest: Z{min(z for _, z in zd_viol):.4f}")
+            else:
+                zd_detail = "No move below Z-4.15\""
+            self._add_check_row("ZD  (Z Depth Limit)", zd_badge, zd_detail)
+            zd_hit = (zd_viol[0][0] + 1) if zd_viol else None
+            self._add_context(result.get("z_deep_context") or [], zd_hit)
+
+        # ── IC (Integer Coordinates) ──────────────────────────────────────────
+        if "int_coord_ok" in applicable:
+            txt, fg, bg = _ok_to_badge(result.get("int_coord_ok"))
+            ic_badge = _badge(txt, fg, bg)
+            ic_hits = result.get("int_coord_hits") or []
+            if ic_hits:
+                ic_detail = f"{len(ic_hits)} integer X/Z coordinate(s) (missing decimal?)"
+            else:
+                ic_detail = "All X/Z coordinates have decimals"
+            self._add_check_row("IC  (Integer Coordinates)", ic_badge, ic_detail)
+            # int_coord_hits are already (line_no, text) tuples
+            self._add_context(ic_hits[:8], ic_hits[0][0] if ic_hits else None)
+
+        # ── CBORE (STEP counterbore) ──────────────────────────────────────────
+        if "cbore_ok" in applicable:
+            txt, fg, bg = _ok_to_badge(result.get("cbore_ok"))
+            cbore_badge = _badge(txt, fg, bg)
+            cf = result.get("cbore_found_in")
+            ce = result.get("cbore_expected_in")
+            cd = result.get("cbore_diff_in")
+            title_cb = result.get("step_cb_mm")
+            cbore_detail = (f"Found: {_inch(cf)}  ({_mm(cf)})"
+                            f"    Expected: {_inch(ce)}  ({_mm(ce)})")
+            if title_cb is not None:
+                cbore_detail += f"    Title: {title_cb:.1f}mm +0.1"
+            if cd is not None:
+                cbore_detail += f"    Diff: {cd:+.4f}\""
+            self._add_check_row("CBORE  (Counterbore)", cbore_badge, cbore_detail)
+
+        # ── SDOK (STEP depth vs comment) ──────────────────────────────────────
+        if "sd_score_ok" in applicable:
+            txt, fg, bg = _ok_to_badge(result.get("sd_score_ok"))
+            sd_badge = _badge(txt, fg, bg)
+            depth = result.get("step_depth_in")
+            sc    = result.get("sd_comment_in")
+            se    = result.get("sd_expected_in")
+            depth_s = f'{depth:.3f}"' if depth is not None else "—"
+            if sc is not None:
+                sd_detail = (f"Found: {depth_s}"
+                             f"    Expected: {se:.3f}\" (comment {sc:.2f}\" + 0.03)")
+            else:
+                sd_detail = (f"Found: {depth_s}"
+                             f"    (no “(N deep step)” comment — cannot verify)")
+            self._add_check_row("SDOK  (Step Depth)", sd_badge, sd_detail)
+
+        # ── Detected dimension tokens (informational, not scored) ─────────────
+        info = []
+        if result.get("recess_x_in") is not None:
+            info.append(f"RC {result['recess_x_in']:.3f}\"")
+        if result.get("hub_od_in") is not None:
+            info.append(f"HB {result['hub_od_in']:.3f}\"")
+        if result.get("implicit_hub_in") is not None:
+            info.append(f"IH {result['implicit_hub_in']:.3f}\"")
+        if result.get("step_cb_mm") is not None:
+            info.append(f"STEP {result['step_cb_mm']:.1f}mm")
+        if result.get("step_depth_in") is not None:
+            info.append(f"SD {result['step_depth_in']:.3f}\"")
+        if info:
+            self._content_lay.addWidget(_sep())
+            il = QLabel("  Detected (not scored):   " + "   •   ".join(info))
+            il.setStyleSheet(
+                "color:#66aadd; font-size:10px; background:#0a1420;"
+                " padding:2px 6px; border-radius:3px;")
+            self._content_lay.addWidget(il)
 
         self._content_lay.addStretch()
 

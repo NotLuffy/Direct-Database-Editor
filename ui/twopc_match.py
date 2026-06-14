@@ -24,7 +24,7 @@ from verifier import parse_title_specs
 
 _PAIR_TOL   = 0.005
 _HUB_OFFSET = 0.003
-_CB_TOL_MM  = 1.0   # CB/OB filter tolerance in mm (tight — 74.4 won't match 73.1)
+_CB_TOL_MM  = 0.01  # CB/OB filter tolerance in mm — exact match only
 _THICK_TOL  = 0.15
 
 _ROUND_SIZES = ["All", "5.75", "6.00", "6.25", "6.50", "7.00", "7.50",
@@ -563,7 +563,7 @@ class TwoPCMatchDialog(QDialog):
         combo_lbl.setStyleSheet("color:#aaaacc; font-weight:bold;")
         combo_row.addWidget(combo_lbl)
         self._combo_edit = QLineEdit()
-        self._combo_edit.setPlaceholderText("e.g.  A+20mm   B+A   C+B")
+        self._combo_edit.setPlaceholderText("e.g.  B+A   C+B   A+20mm")
         self._combo_edit.setFixedWidth(180)
         self._combo_edit.setStyleSheet(
             "QLineEdit { background:#1a1d2e; border:1px solid #44ddff; "
@@ -572,9 +572,9 @@ class TwoPCMatchDialog(QDialog):
         self._combo_edit.textChanged.connect(self._on_combo_changed)
         combo_row.addWidget(self._combo_edit)
         combo_note = QLabel(
-            "First = hub piece (0.25\" hub),  Second = recess piece.  "
-            "Fills Thick filter on both sides.  Letters A–H or MM (20mm=0.75\").  "
-            "Gap = RC − HB − 0.003\"  (ideal 0.000\")."
+            "B+A → left=0.50\" hub+RC (2PC HC),  right=0.25\" mating hub.  "
+            "A+20mm → left=0.25\" hub,  right=recess piece.  "
+            "Letters A–H or MM (20mm=0.75\").  Gap = RC − HB − 0.003\"."
         )
         combo_note.setStyleSheet("color: #555577; font-size: 10px;")
         combo_row.addWidget(combo_note)
@@ -683,18 +683,41 @@ class TwoPCMatchDialog(QDialog):
         self._refilter_right()
 
     def _on_combo_changed(self, text: str):
-        """Parse 'A+20mm' style notation → set Thick filter on both sides.
-        First term = hub piece (left), second term = recess piece (right)."""
+        """Parse order combo notation → set Thick filter and mode on both sides.
+
+        Two styles:
+          B+A   — both letter codes A–H:
+                  left = B piece (0.50" hub + RC, hb50 mode)
+                  right = A piece (0.25" mating hub, hb mode)
+          A+20mm — first=letter/MM, second=MM/inch:
+                  left = hub piece (0.25" HB, hb mode)
+                  right = recess piece (RC mode)
+        """
         parts = [p.strip() for p in text.split("+") if p.strip()]
-        hub_text    = parts[0] if len(parts) >= 1 else ""
-        recess_text = parts[1] if len(parts) >= 2 else ""
-        # Left side should be hub (HB), right side recess (RC) — switch tabs if needed
-        if hub_text and self._left.mode != "hb":
-            self._left._set_mode("hb")
-        if recess_text and self._right.mode != "rc":
-            self._right._set_mode("rc")
-        self._left.set_thick(hub_text)
-        self._right.set_thick(recess_text)
+        first_text  = parts[0] if len(parts) >= 1 else ""
+        second_text = parts[1] if len(parts) >= 2 else ""
+
+        _letter_re = re.compile(r'^[A-Ha-h]$')
+        first_is_letter  = bool(_letter_re.match(first_text))
+        second_is_letter = bool(_letter_re.match(second_text))
+
+        if first_is_letter and second_is_letter:
+            # 2PC HC combo: left = B piece (hb50), right = A piece (hb)
+            if self._left.mode != "hb50":
+                self._left._apply_style("hb50")
+                self._refilter_left()
+            if self._right.mode != "hb":
+                self._right._apply_style("hb")
+                self._refilter_right()
+        else:
+            # Standard combo: left = hub piece (hb), right = recess piece (rc)
+            if first_text and self._left.mode != "hb":
+                self._left._set_mode("hb")
+            if second_text and self._right.mode != "rc":
+                self._right._set_mode("rc")
+
+        self._left.set_thick(first_text)
+        self._right.set_thick(second_text)
 
     def _on_show_pairs(self):
         dlg = _PairsDialog(self._raw_a, self._raw_b, self)
@@ -717,19 +740,21 @@ class TwoPCMatchDialog(QDialog):
     def _source(self, mode: str) -> list:
         if mode == "hb50":
             # Combo pieces: have an RC token AND provide a 0.50" hub.
-            # Two cases:
-            #   (a) Explicit HB ≈ 0.50 token (old-style detected hub OD)
-            #   (b) HC 2PC: hub height comes from title HC spec or IH token
-            #       (no HB token — hub is the HC itself at 0.50")
+            # Consistent with _part_type(): IH >= 0.40" OR HC title spec ≈ 0.50"
+            # All records in raw_a already have RC present (required for inclusion).
             def _is_hb50(r):
+                # Explicit HB token ≈ 0.50" (rare — hub OD detected)
                 hb = r.get("hb")
                 if hb is not None and abs(hb - 0.50) < 0.03:
                     return True
+                # HC title spec ≈ 0.50"
                 hc = r.get("hc")
                 if hc is not None and abs(hc - 0.50) < 0.06:
                     return True
+                # IH token >= 0.40" — true 2PC HC hub (0.47–0.50" typical)
+                # Mirrors the threshold used in _part_type() to classify "2PC HC"
                 ih = r.get("hub_height")
-                if ih is not None and abs(ih - 0.50) < 0.06:
+                if ih is not None and ih >= 0.40:
                     return True
                 return False
             return [r for r in self._raw_a if _is_hb50(r)]
@@ -955,7 +980,8 @@ class TwoPCMatchDialog(QDialog):
                 f"CB:        {rec['cb_mm']:.1f} mm"     if rec['cb_mm']    else "CB:        —",
                 f"OB:        {rec['ob_mm']:.1f} mm"     if rec['ob_mm']    else "OB:        —",
                 _fmt_thick(rec),
-                "Hub:       0.50\" HC (provides hub to mate with 0.25\" HB piece)",
+                (f"Hub (IH):  {hc_val:.3f}\" (mates with 0.25\" HB piece)" if hc_val
+                 else "Hub (IH):  — (run Verify Dimensions first)"),
             ]
             return "\n".join(lines)
         token = "RC" if mode == "rc" else "HB"

@@ -164,7 +164,7 @@ story += [
         ["Column",       "What It Shows"],
         ["O-Number",     "The program number (e.g. O70189)"],
         ["File Name",    "The filename on disk"],
-        ["Score",        "Verification score out of 7  (see Section 4)"],
+        ["Score",        "Verification score out of 8  (see Section 4)"],
         ["Lines",        "Number of non-blank lines in the file"],
         ["Status",       "Current status — see status colours below"],
         ["Type",         "Part type derived from the title (STD, HC, 2PC, STEP, STEEL…)"],
@@ -220,7 +220,7 @@ story += [
 # ── 4. Verification Scores ────────────────────────────────────────────────────
 story += [
     h1("4 — Verification Scores"),
-    p("Each file is scored out of 7. The score counts how many of the "
+    p("Each file is scored out of 8. The score counts how many of the "
       "following checks pass:"),
     sp(4),
     table([

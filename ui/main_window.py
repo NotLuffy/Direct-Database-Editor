@@ -14,14 +14,16 @@ from PyQt6.QtWidgets import (
     QFileDialog, QMessageBox, QToolBar, QStatusBar, QMenu, QDialog,
     QFormLayout, QLineEdit, QDialogButtonBox, QInputDialog, QCheckBox,
     QTabWidget, QProgressDialog, QCalendarWidget, QScrollArea,
-    QSpinBox, QDoubleSpinBox
+    QSpinBox, QDoubleSpinBox, QTableWidget, QTableWidgetItem
 )
 from PyQt6.QtCore import Qt, QSortFilterProxyModel, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QAction, QColor
 
 import direct_database as db
 import verifier
-from direct_models import DirectFileTableModel, COLUMNS, COL_IDX, _PART_TYPE_FILTERS, VerifyStatusDelegate
+from direct_models import (DirectFileTableModel, COLUMNS, COL_IDX,
+                           _PART_TYPE_FILTERS, _part_type, _is_2pc,
+                           VerifyStatusDelegate)
 from direct_scanner import IndexWorker
 from ui.sidebar import DirectSidebar
 from ui.filter_bar import FilterBar
@@ -88,20 +90,21 @@ class _ReverifyWorker(QThread):
 
     def run(self):
         if not self.db_path:
-            self.finished.emit(0)
+            self.finished.emit(0, 0)
             return
         try:
-            from direct_scorer import score_file
+            from direct_scorer import (score_file, parse_overrides,
+                                       apply_overrides_to_status)
             conn = db.get_connection(self.db_path)
             rows = conn.execute(
-                "SELECT id, file_path, program_title, o_number FROM files "
+                "SELECT id, file_path, program_title, o_number, notes FROM files "
                 "WHERE last_seen IS NOT NULL ORDER BY id"
             ).fetchall()
-            conn.close()
 
             total   = len(rows)
             updated = 0
             failed  = 0
+            # Single connection + periodic commit (far faster than per-row connect).
             for i, row in enumerate(rows):
                 if self._cancelled:
                     break
@@ -111,21 +114,25 @@ class _ReverifyWorker(QThread):
                 try:
                     score, vstatus = score_file(path, row["program_title"] or "",
                                                 o_number=row["o_number"] or "")
-                    conn2 = db.get_connection(self.db_path)
-                    with conn2:
-                        conn2.execute(
-                            "UPDATE files SET verify_score=?, verify_status=? WHERE id=?",
-                            (score, vstatus, row["id"])
-                        )
-                    conn2.close()
+                    # Preserve manual overrides ([OVERRIDE:...] in notes)
+                    overrides = parse_overrides(row["notes"] or "")
+                    if overrides:
+                        score, vstatus = apply_overrides_to_status(vstatus, overrides)
+                    conn.execute(
+                        "UPDATE files SET verify_score=?, verify_status=? WHERE id=?",
+                        (score, vstatus, row["id"])
+                    )
                     updated += 1
                 except Exception:
                     failed += 1
                 if i % 50 == 0 or i == total - 1:
+                    conn.commit()
                     self.progress.emit(i + 1, total)
 
+            conn.commit()
+            conn.close()
             self.finished.emit(updated, failed)
-        except Exception as exc:
+        except Exception:
             import logging
             logging.exception("ReverifyWorker crashed")
             self.finished.emit(0, 0)
@@ -172,6 +179,63 @@ class _DirectProxy(QSortFilterProxyModel):
         if pt and pt != "All":
             fn = _PART_TYPE_FILTERS.get(pt)
             if fn and not fn(title):
+                # Geometry wins: a G-code STEP (counterbore) has no "STEP" keyword
+                # in the title, so let the STEP: verify token satisfy the STEP filter.
+                if pt == "STEP" and re.search(r'\bSTEP:\d', rec["verify_status"] or ""):
+                    pass
+                else:
+                    return False
+
+        # 2PC piece role — from verify tokens (Recess=RC, Hub=0.25" HB/IH, HC=2PC HC).
+        # Scoped to 2PC programs only.
+        role = f.get("twopc_role") or ""
+        if role:
+            vstatus = rec["verify_status"] or ""
+            if not _is_2pc(title):
+                return False
+            if role == "Recess":
+                if not re.search(r'\bRC:\d', vstatus):
+                    return False
+            elif role == "HC":
+                if _part_type(title, vstatus) != "2PC HC":
+                    return False
+            elif role == "Hub":
+                has_hub_tok = bool(re.search(r'\b(?:HB|IH):\d', vstatus))
+                if not has_hub_tok or _part_type(title, vstatus) == "2PC HC":
+                    return False
+
+        # Recess value (RC token) — exact match (values are distinct at 0.001")
+        rc_v = f.get("rc_value")
+        if rc_v is not None:
+            m = re.search(r'\bRC:(\d+(?:\.\d+)?)', rec["verify_status"] or "")
+            if not m or abs(float(m.group(1)) - rc_v) > 0.0005:
+                return False
+
+        # Step depth value (SD token) — match within ±0.02"
+        sd_v = f.get("step_depth")
+        if sd_v is not None:
+            m = re.search(r'\bSD:(\d+(?:\.\d+)?)', rec["verify_status"] or "")
+            if not m or abs(float(m.group(1)) - sd_v) > 0.02:
+                return False
+
+        # Counterbore value (mm) — STEP counterbore from title step_mm OR STEP token
+        cbore_v = f.get("cbore_value")
+        if cbore_v is not None:
+            cands = []
+            specs = _vfy.parse_title_specs(title)
+            if specs and specs.get("step_mm") is not None:
+                cands.append(specs["step_mm"])
+            m = re.search(r'\bSTEP:(\d+(?:\.\d+)?)', rec["verify_status"] or "")
+            if m:
+                cands.append(float(m.group(1)))
+            if not any(abs(c - cbore_v) <= 0.15 for c in cands):
+                return False
+
+        # Hub OD value (HB token, inches) — exact match (values are distinct at 0.001")
+        hb_v = f.get("hb_value")
+        if hb_v is not None:
+            m = re.search(r'\bHB:(\d+(?:\.\d+)?)', rec["verify_status"] or "")
+            if not m or abs(float(m.group(1)) - hb_v) > 0.0005:
                 return False
 
         # Round size
@@ -487,18 +551,18 @@ class DirectMainWindow(QMainWindow):
         hdr.setStretchLastSection(True)
         hdr.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         hdr.customContextMenuRequested.connect(self._on_header_context_menu)
-        # Sensible default widths
-        hdr.resizeSection(0, 80)   # O-Number
-        hdr.resizeSection(1, 130)  # File Name
-        hdr.resizeSection(2, 55)   # Score
-        hdr.resizeSection(3, 58)   # Lines
-        hdr.resizeSection(4, 70)   # Status
-        hdr.resizeSection(5, 65)   # Type
-        hdr.resizeSection(6, 220)  # Title
-        hdr.resizeSection(7, 100)  # Folder
-        hdr.resizeSection(8, 35)   # Dup
-        hdr.resizeSection(9, 260)  # Path
-        hdr.resizeSection(10, 140) # Notes
+        # Sensible default widths (by column name — robust to column reordering)
+        _default_widths = {
+            "o_number": 80, "file_name": 130, "verify_score": 55, "line_count": 58,
+            "status": 70, "part_type": 65,
+            "spec_round": 56, "spec_thick": 60, "spec_cb": 52, "spec_ob": 52,
+            "spec_hub": 64,
+            "program_title": 220, "source_folder": 100, "has_dup_flag": 35,
+            "file_path": 260, "notes": 140,
+        }
+        for _name, _w in _default_widths.items():
+            if _name in COL_IDX:
+                hdr.resizeSection(COL_IDX[_name], _w)
         # Verify (last) stretches to fill
 
         # Colored token delegate for the Verify column
@@ -616,23 +680,33 @@ class DirectMainWindow(QMainWindow):
                     verifier.apply_overrides(overrides)
                 except Exception:
                     pass
+            # Apply any P-code overrides from config
+            pcode_overrides = cfg.get("pcode_overrides", {})
+            if pcode_overrides:
+                try:
+                    import verifier
+                    verifier.apply_pcode_overrides(pcode_overrides)
+                except Exception:
+                    pass
             folders = cfg.get("scan_folders", [])
             db_path = cfg.get("db_path", "")
             if db_path and os.path.exists(db_path) and folders:
                 self.db_path      = db_path
                 self.scan_folders = [f for f in folders if os.path.isdir(f)]
                 self._on_workspace_ready()
-            # Restore hidden columns
+            # Restore hidden columns (keyed by column name; old int keys ignored)
             hdr = self._table.horizontalHeader()
-            for col in cfg.get("hidden_columns", []):
-                if 0 <= col < len(COLUMNS):
-                    hdr.setSectionHidden(col, True)
-            # Restore column widths
-            for col_str, width in cfg.get("column_widths", {}).items():
-                try:
-                    hdr.resizeSection(int(col_str), int(width))
-                except Exception:
-                    pass
+            for name in cfg.get("hidden_columns", []):
+                if name in COL_IDX:
+                    hdr.setSectionHidden(COL_IDX[name], True)
+            # Restore column widths (keyed by column name; old int keys ignored so
+            # the sensible defaults stand after columns were added/reordered)
+            for col_key, width in cfg.get("column_widths", {}).items():
+                if col_key in COL_IDX:
+                    try:
+                        hdr.resizeSection(COL_IDX[col_key], int(width))
+                    except Exception:
+                        pass
             # Restore window geometry
             geom = cfg.get("window_geometry")
             if geom:
@@ -654,17 +728,20 @@ class DirectMainWindow(QMainWindow):
     def _save_config(self):
         try:
             hdr = self._table.horizontalHeader()
-            hidden = [i for i in range(len(COLUMNS)) if hdr.isSectionHidden(i)]
-            col_widths = {str(i): hdr.sectionSize(i)
+            hidden = [COLUMNS[i][0] for i in range(len(COLUMNS))
+                      if hdr.isSectionHidden(i)]
+            col_widths = {COLUMNS[i][0]: hdr.sectionSize(i)
                           for i in range(len(COLUMNS))
                           if not hdr.isSectionHidden(i)}
-            # Preserve existing verify_overrides if present
+            # Preserve existing overrides if present
             verify_overrides = {}
+            pcode_overrides  = {}
             if os.path.exists(self.config_path):
                 try:
                     with open(self.config_path) as f:
                         existing = json.load(f)
                     verify_overrides = existing.get("verify_overrides", {})
+                    pcode_overrides  = existing.get("pcode_overrides",  {})
                 except Exception:
                     pass
             cfg = {
@@ -677,6 +754,8 @@ class DirectMainWindow(QMainWindow):
             }
             if verify_overrides:
                 cfg["verify_overrides"] = verify_overrides
+            if pcode_overrides:
+                cfg["pcode_overrides"] = pcode_overrides
             with open(self.config_path, "w") as f:
                 json.dump(cfg, f, indent=2)
         except Exception:
@@ -710,7 +789,6 @@ class DirectMainWindow(QMainWindow):
                 f'"{folder_name}" is already part of the current database.')
             return
 
-        # Build a clear choice dialog
         msg = QMessageBox(self)
         msg.setWindowTitle("Open Database")
         msg.setIcon(QMessageBox.Icon.Question)
@@ -719,21 +797,20 @@ class DirectMainWindow(QMainWindow):
             msg.setText(
                 f'"{folder_name}" already has a database.\n\n'
                 "What would you like to do?")
-            open_btn   = msg.addButton("Open its Database",    QMessageBox.ButtonRole.AcceptRole)
-            add_btn    = msg.addButton("Add to Current Scan",  QMessageBox.ButtonRole.ActionRole)
+            msg.addButton("Open its Database",   QMessageBox.ButtonRole.AcceptRole)
+            msg.addButton("Add to Current Scan", QMessageBox.ButtonRole.ActionRole)
         else:
             msg.setText(
                 f'"{folder_name}" has no database yet.\n\n'
                 "What would you like to do?")
-            open_btn   = msg.addButton("Create New Database Here", QMessageBox.ButtonRole.AcceptRole)
-            add_btn    = msg.addButton("Add to Current Scan",       QMessageBox.ButtonRole.ActionRole)
+            msg.addButton("Create New Database Here", QMessageBox.ButtonRole.AcceptRole)
+            msg.addButton("Add to Current Scan",      QMessageBox.ButtonRole.ActionRole)
 
         msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
         msg.exec()
 
         clicked_text = msg.clickedButton().text() if msg.clickedButton() else ""
         if clicked_text in ("Open its Database", "Create New Database Here"):
-            # Switch to this folder's database (disconnect current first)
             self.scan_folders = []
             self.db_path = ""
             self._model = None
@@ -742,33 +819,19 @@ class DirectMainWindow(QMainWindow):
             self._table_header.setText("  Files  (0)")
             self._open_db_in_folder(folder)
         elif clicked_text == "Add to Current Scan":
-            # Add folder to current multi-folder scan
             self.scan_folders.append(folder)
             self._save_config()
             self._on_workspace_ready()
             self._on_rescan()
 
     def _open_db_in_folder(self, folder: str):
-        """Connect to a folder's database, clearing stale data from other locations."""
+        """Connect to a folder's database."""
         self.scan_folders = [folder]
         db_path = os.path.join(folder, "condenser_direct.db")
         db.init_schema(db_path)
 
-        # If the DB has records from a different location, wipe it completely
-        # and recreate from scratch — delete the file so there's no chance of
-        # stale rows surviving (FK issues, swallowed exceptions, etc.)
-        existing_folders = db.get_distinct_source_folders(db_path)
-        stale = [f for f in existing_folders
-                 if os.path.normcase(os.path.normpath(f)) !=
-                    os.path.normcase(os.path.normpath(folder))]
-        if stale:
-            try:
-                import os as _os
-                if _os.path.exists(db_path):
-                    _os.remove(db_path)
-            except Exception:
-                pass
-            db.init_schema(db_path)  # recreate empty DB
+        # Remap paths if DB was last written on a different machine (Google Drive sync).
+        db.remap_paths_if_needed(db_path)
 
         self.db_path = db_path
         self._save_config()
@@ -992,6 +1055,24 @@ class DirectMainWindow(QMainWindow):
         self._on_row_count_changed(self._proxy.rowCount())
         self._update_filter_spec_data()
 
+    def _refresh_quick(self):
+        """Lightweight refresh for status/notes/verify changes.
+        Reloads the table and sidebar counts but skips re-parsing all titles
+        for filter dropdowns — those don't change when only status is updated."""
+        if not self.db_path or self._model is None:
+            return
+        current_filters = self._filter_bar.current_filters() if self._filter_bar.isVisible() else {}
+        db_filters = {
+            "status":       current_filters.get("status"),
+            "has_dup_flag": current_filters.get("has_dup_flag"),
+            "score_min":    current_filters.get("score_min"),
+            "score_max":    current_filters.get("score_max"),
+        }
+        self._model.refresh({k: v for k, v in db_filters.items() if v is not None})
+        self._proxy.set_filters(current_filters)
+        self._update_sidebar_counts()
+        self._on_row_count_changed(self._proxy.rowCount())
+
     def _update_filter_spec_data(self):
         """Parse all DB titles and feed spec data to the filter bar dropdowns."""
         if not self.db_path:
@@ -1001,7 +1082,21 @@ class DirectMainWindow(QMainWindow):
         except Exception:
             return
         specs = []
+        rc_vals: set    = set()  # recess diameters from RC: tokens (inches)
+        step_vals: set  = set()  # step depths from SD: tokens (inches)
+        cbore_vals: set = set()  # counterbore diameters (mm) — step_mm / STEP token
+        hb_vals: set    = set()  # hub OD from HB: tokens (inches)
         for r in rows:
+            vstatus = r["verify_status"] or ""
+            if vstatus:
+                for m in re.finditer(r'\bRC:(\d+(?:\.\d+)?)', vstatus):
+                    rc_vals.add(round(float(m.group(1)), 3))
+                for m in re.finditer(r'\bSD:(\d+(?:\.\d+)?)', vstatus):
+                    step_vals.add(round(float(m.group(1)), 3))
+                for m in re.finditer(r'\bSTEP:(\d+(?:\.\d+)?)', vstatus):
+                    cbore_vals.add(round(float(m.group(1)), 1))
+                for m in re.finditer(r'\bHB:(\d+(?:\.\d+)?)', vstatus):
+                    hb_vals.add(round(float(m.group(1)), 3))
             title = r["program_title"] or ""   # sqlite3.Row — use [] not .get()
             if not title:
                 continue
@@ -1009,6 +1104,8 @@ class DirectMainWindow(QMainWindow):
                 s = _vfy.parse_title_specs(title)
             except Exception:
                 continue
+            if s is not None and s.get("step_mm") is not None:
+                cbore_vals.add(round(s["step_mm"], 1))
             if s is None:
                 continue
             th_in      = s.get("length_in")
@@ -1023,6 +1120,8 @@ class DirectMainWindow(QMainWindow):
                 "hc_in":      hc_in,
             })
         self._filter_bar.set_spec_data(specs)
+        self._filter_bar.set_twopc_values(sorted(rc_vals), sorted(step_vals),
+                                          sorted(cbore_vals), sorted(hb_vals))
 
     def _update_sidebar_counts(self):
         if not self.db_path:
@@ -1111,18 +1210,18 @@ class DirectMainWindow(QMainWindow):
             group_type = key.replace("dup_", "")
             self._dup_panel.load_all_by_type(group_type)
             self._bottom_tabs.setCurrentWidget(self._dup_panel)
-        elif key == "score_7":
-            db_filters["score_min"] = 7
+        elif key == "score_8":
+            db_filters["score_min"] = 8
+            db_filters["score_max"] = 8
+        elif key == "score_67":
+            db_filters["score_min"] = 6
             db_filters["score_max"] = 7
-        elif key == "score_56":
-            db_filters["score_min"] = 5
-            db_filters["score_max"] = 6
-        elif key == "score_34":
-            db_filters["score_min"] = 3
-            db_filters["score_max"] = 4
-        elif key == "score_02":
+        elif key == "score_45":
+            db_filters["score_min"] = 4
+            db_filters["score_max"] = 5
+        elif key == "score_03":
             db_filters["score_min"] = 0
-            db_filters["score_max"] = 2
+            db_filters["score_max"] = 3
         elif key == "recent_7d":
             db_filters["recent_days"] = 7
         elif key in ("verify_pass", "verify_fail", "verify_none"):
@@ -1415,7 +1514,7 @@ class DirectMainWindow(QMainWindow):
                 first.get("o_number", "") or "",
             )
             self._bottom_tabs.setCurrentWidget(self._verify_panel)
-        self._refresh_all()
+        self._refresh_quick()
 
     def _action_open_location(self, rec: dict):
         if not self._guard_scope(rec):
@@ -1459,7 +1558,7 @@ class DirectMainWindow(QMainWindow):
                 self.db_path, rec["id"], new_path, new_fname,
                 new_onum.group(1).upper() if new_onum else new_name.upper()
             )
-            self._refresh_all()
+            self._refresh_quick()
         except Exception as exc:
             QMessageBox.critical(self, "Rename Failed", str(exc))
 
@@ -1520,7 +1619,7 @@ class DirectMainWindow(QMainWindow):
             db.update_file_after_edit(
                 self.db_path, rec["id"], file_hash, line_count,
                 title, derived, vstatus, score, rec["has_dup_flag"], mtime)
-            self._refresh_all()
+            self._refresh_quick()
             QMessageBox.information(self, "Done",
                 f"Chain comment written to {rec['file_name']}.")
         except Exception as exc:
@@ -1590,7 +1689,7 @@ class DirectMainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_file_saved(self, file_id: int):
-        self._refresh_all()
+        self._refresh_quick()
 
     def _on_dup_open_editor(self, file_id: int, file_path: str,
                              o_number: str, verify_status: str, verify_score: int):
@@ -1618,7 +1717,7 @@ class DirectMainWindow(QMainWindow):
                 return
         for rec in recs:
             db.update_file_status(self.db_path, rec["id"], status)
-        self._refresh_all()
+        self._refresh_quick()
 
     def _set_verified_multi(self, recs: list[dict]):
         """Set status to 'verified' and stamp the G-code file with a VERIFIED comment."""
@@ -1654,7 +1753,7 @@ class DirectMainWindow(QMainWindow):
             except Exception:
                 pass  # file write failure — still update DB status
             db.update_file_status(self.db_path, rec["id"], "verified")
-        self._refresh_all()
+        self._refresh_quick()
 
     def _apply_verify_override(self, rec: dict, check_token: str, value: str):
         """Override a single verification check to PASS or FAIL."""
@@ -1674,7 +1773,7 @@ class DirectMainWindow(QMainWindow):
                 "UPDATE files SET notes=?, verify_score=?, verify_status=? WHERE id=?",
                 (new_notes, new_score, new_vstatus, rec["id"]))
         conn.close()
-        self._refresh_all()
+        self._refresh_quick()
 
     def _clear_verify_overrides(self, rec: dict):
         """Remove all overrides and re-verify the file from scratch."""
@@ -1692,7 +1791,7 @@ class DirectMainWindow(QMainWindow):
                 "UPDATE files SET notes=?, verify_score=?, verify_status=? WHERE id=?",
                 (new_notes, score, vstatus, rec["id"]))
         conn.close()
-        self._refresh_all()
+        self._refresh_quick()
 
     def _copy_onum(self, rec: dict):
         from PyQt6.QtWidgets import QApplication
@@ -1816,7 +1915,7 @@ class DirectMainWindow(QMainWindow):
 
         if errors:
             QMessageBox.warning(self, "Delete Errors", "\n".join(errors))
-        self._refresh_all()
+        self._refresh_quick()
 
     # ------------------------------------------------------------------
     # Re-verify all
@@ -1835,7 +1934,7 @@ class DirectMainWindow(QMainWindow):
         dlg = BatchReplaceDialog(self.db_path, initial_find=find,
                                  initial_filter=title_filter, parent=self)
         dlg.exec()
-        self._refresh_all()
+        self._refresh_quick()
 
     def _open_feed_audit(self, file_ids: list | None = None):
         from ui.feed_audit import FeedAuditDialog
@@ -2141,11 +2240,11 @@ class DirectMainWindow(QMainWindow):
         for winner, losers in plan[:15]:
             preview_lines.append(
                 f"  KEEP  {winner['file_name']}  "
-                f"(score {winner['verify_score'] or 0}/7, {winner['line_count'] or 0} lines)")
+                f"(score {winner['verify_score'] or 0}/8, {winner['line_count'] or 0} lines)")
             for loser in losers:
                 preview_lines.append(
                     f"  DELETE  {loser['file_name']}  "
-                    f"(score {loser['verify_score'] or 0}/7, {loser['line_count'] or 0} lines)")
+                    f"(score {loser['verify_score'] or 0}/8, {loser['line_count'] or 0} lines)")
             preview_lines.append("")
         if len(plan) > 15:
             preview_lines.append(f"  … and {len(plan) - 15} more group(s)")
@@ -2356,51 +2455,69 @@ class DirectMainWindow(QMainWindow):
         if not dest:
             return
 
+        try:
+            self._run_export_files(dest)
+        except Exception as exc:
+            import traceback
+            QMessageBox.critical(self, "Export Files Error",
+                f"Export failed:\n{exc}\n\n{traceback.format_exc()}")
+
+    def _run_export_files(self, dest: str):
         import shutil
         from verifier import parse_title_specs
+        from ui.export_xlsx import _ROUND_SHEETS
 
-        # Round-size buckets: label → (lo_in, hi_in)
-        # These mirror _ROUND_TO_O_RANGE in verifier.py
-        _BUCKETS = [
-            ("5.75-6.50",  5.75,  6.50),
-            ("7.00-8.50",  7.00,  8.50),
-            ("9.50",       9.50,  9.50),
-            ("10.00-13.00",10.00, 13.00),
-        ]
-
-        def _bucket_for(rs: float) -> str:
-            for label, lo, hi in _BUCKETS:
-                if lo - 0.01 <= rs <= hi + 0.01:
-                    return label
+        def _folder_for(rs: float | None) -> str:
+            if rs is None:
+                return "special"
+            for sheet_name, round_sizes, _, _ in _ROUND_SHEETS:
+                if any(abs(rs - r) < 0.01 for r in round_sizes):
+                    return sheet_name
             return "special"
 
-        rows = db.get_all_files(self.db_path)
+        conn = db.get_connection(self.db_path)
+        rows = conn.execute(
+            "SELECT file_path, program_title FROM files "
+            "WHERE file_path IS NOT NULL AND file_path != '' "
+            "ORDER BY o_number"
+        ).fetchall()
+        conn.close()
+
         if not rows:
             QMessageBox.information(self, "Export Files", "No files found in database.")
             return
 
-        copied   = 0
-        skipped  = 0
-        errors   = []
+        total = len(rows)
+        prog = QProgressDialog("Exporting files…", "Cancel", 0, total, self)
+        prog.setWindowTitle("Export Files")
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.setValue(0)
+
+        copied    = 0
+        skipped   = 0
+        errors    = []
         by_folder: dict[str, int] = {}
 
-        for rec in rows:
+        for i, rec in enumerate(rows):
+            if prog.wasCanceled():
+                break
+            prog.setValue(i)
+
             src = rec["file_path"]
             if not src or not os.path.isfile(src):
                 skipped += 1
                 continue
 
-            title = rec.get("program_title") or ""
+            title = rec["program_title"] or ""
             specs = None
             try:
                 specs = parse_title_specs(title)
             except Exception:
                 pass
 
-            if specs and specs.get("round_size_in") is not None:
-                folder_name = _bucket_for(specs["round_size_in"])
-            else:
-                folder_name = "special"
+            rs          = specs.get("round_size_in") if specs else None
+            folder_name = _folder_for(rs)
 
             out_dir = os.path.join(dest, folder_name)
             os.makedirs(out_dir, exist_ok=True)
@@ -2408,7 +2525,6 @@ class DirectMainWindow(QMainWindow):
             fname    = os.path.basename(src)
             out_path = os.path.join(out_dir, fname)
 
-            # If a file with this name already exists, append _A/_B/… suffix
             if os.path.exists(out_path):
                 base, ext = os.path.splitext(fname)
                 suffix_ord = ord('A')
@@ -2423,12 +2539,13 @@ class DirectMainWindow(QMainWindow):
             except Exception as exc:
                 errors.append(f"{fname}: {exc}")
 
-        # Build summary
+        prog.setValue(total)
+
         lines = [f"Exported {copied:,} file(s) to:\n{dest}\n"]
         for fname in sorted(by_folder):
             lines.append(f"  {fname}/  — {by_folder[fname]:,} file(s)")
         if skipped:
-            lines.append(f"\n{skipped} skipped (file missing on disk)")
+            lines.append(f"\n{skipped} skipped (file not found on disk)")
         if errors:
             lines.append(f"\n{len(errors)} error(s):")
             lines.extend(f"  {e}" for e in errors[:10])
@@ -2440,6 +2557,237 @@ class DirectMainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Settings
     # ------------------------------------------------------------------
+
+    def _build_pcode_tab(self) -> tuple[QWidget, dict]:
+        """Build the P-Codes settings tab.
+
+        Returns (tab_widget, tables_dict) where tables_dict has keys
+        'lathe1' and 'lathe23', each a QTableWidget.
+        """
+        import verifier
+
+        _CELL_SS = ("background:#1a1d2e; border:1px solid #2a2d45; "
+                    "color:#ccccdd; padding:2px;")
+        _HDR_SS  = "font-weight:bold; color:#88ccff; margin-top:6px;"
+        _SUB_SS  = "font-weight:bold; color:#aaaacc;"
+        _NOTE_SS = "color:#555577; font-size:10px;"
+
+        tab = QWidget()
+        outer = QVBoxLayout(tab)
+        outer.setContentsMargins(12, 12, 12, 8)
+        outer.setSpacing(8)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea{border:none;background:#0d0e18;}")
+        inner_w = QWidget()
+        layout  = QVBoxLayout(inner_w)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        tables = {}
+
+        def _make_table(pc_dict: dict, defaults: dict) -> QTableWidget:
+            t = QTableWidget(0, 3)
+            t.setHorizontalHeaderLabels(["Thickness (in)", "OP1 P#", "OP2 P#"])
+            t.setAlternatingRowColors(False)
+            t.verticalHeader().setVisible(False)
+            t.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            t.setStyleSheet(
+                "QTableWidget{background:#0f1018;gridline-color:#1a1d2e;"
+                "border:1px solid #2a2d45;color:#ccccdd;}"
+                "QHeaderView::section{background:#1a1d2e;color:#8899bb;"
+                "border:none;padding:4px 6px;font-weight:bold;}"
+                "QTableWidget::item:selected{background:#2a3050;}"
+                "QTableWidget::item:alternate{background:#0f1018;}"
+            )
+            hdr = t.horizontalHeader()
+            hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+            hdr.setStretchLastSection(True)
+            for th in sorted(pc_dict.keys()):
+                op1, op2 = pc_dict[th]
+                orig = defaults.get(th)
+                orig_s = f"  (was {orig[0]}/{orig[1]})" if orig and (op1, op2) != orig else ""
+                r = t.rowCount()
+                t.insertRow(r)
+                th_item = QTableWidgetItem(f"{th:.4f}")
+                op1_item = QTableWidgetItem(str(op1))
+                op2_item = QTableWidgetItem(str(op2) + orig_s)
+                th_item.setForeground(QColor("#ccccdd"))
+                op1_item.setForeground(QColor("#44ddff"))
+                op2_item.setForeground(QColor("#ffaa44"))
+                for item in (th_item, op1_item, op2_item):
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                t.setItem(r, 0, th_item)
+                t.setItem(r, 1, op1_item)
+                t.setItem(r, 2, op2_item)
+            return t
+
+        # --- Lathe 1 ---
+        lbl1 = QLabel("Lathe 1  (Round sizes 5.75\"–6.50\")  —  Base P-Codes")
+        lbl1.setStyleSheet(_HDR_SS)
+        layout.addWidget(lbl1)
+
+        note1 = QLabel("Thickness (in) = total part height (disc + hub).  "
+                        "Edit OP1/OP2 values directly.  Add Row for new sizes.")
+        note1.setStyleSheet(_NOTE_SS)
+        note1.setWordWrap(True)
+        layout.addWidget(note1)
+
+        t1 = _make_table(verifier._LATHE1_PC, verifier._DEFAULTS["_LATHE1_PC"])
+        tables["lathe1"] = t1
+        layout.addWidget(t1)
+
+        add1 = QPushButton("+ Add Row  (Lathe 1)")
+        add1.setStyleSheet("QPushButton{background:#0d2030;border:1px solid #226688;"
+                           "color:#44ddff;padding:4px 10px;border-radius:3px;}"
+                           "QPushButton:hover{background:#102840;}")
+        add1.clicked.connect(lambda: self._pcode_add_row(t1))
+        layout.addWidget(add1)
+
+        # Lathe 1 alternates (read-only info)
+        lbl1a = QLabel("Lathe 1  —  Alternate P-Codes  (MM disc sizes, read-only info)")
+        lbl1a.setStyleSheet("font-weight:bold; color:#556688; margin-top:4px;")
+        layout.addWidget(lbl1a)
+        for th, (p1, p2) in sorted(verifier._LATHE1_ALT_PC.items()):
+            row_lbl = QLabel(f"  {th:.4f}\"  →  OP1: P{p1}   OP2: P{p2}")
+            row_lbl.setStyleSheet("color:#445566; font-size:10px;")
+            layout.addWidget(row_lbl)
+
+        # Spacer
+        layout.addSpacing(12)
+
+        # --- Lathe 2/3 ---
+        lbl2 = QLabel("Lathe 2/3  (Round sizes 7.00\"–13.00\")  —  Base P-Codes")
+        lbl2.setStyleSheet(_HDR_SS)
+        layout.addWidget(lbl2)
+
+        note2 = QLabel("Same thickness rules as Lathe 1.  "
+                        "Edit OP1/OP2 values or add new thickness entries.")
+        note2.setStyleSheet(_NOTE_SS)
+        note2.setWordWrap(True)
+        layout.addWidget(note2)
+
+        t2 = _make_table(verifier._LATHE23_PC, verifier._DEFAULTS["_LATHE23_PC"])
+        tables["lathe23"] = t2
+        layout.addWidget(t2)
+
+        add2 = QPushButton("+ Add Row  (Lathe 2/3)")
+        add2.setStyleSheet("QPushButton{background:#0d2030;border:1px solid #226688;"
+                           "color:#44ddff;padding:4px 10px;border-radius:3px;}"
+                           "QPushButton:hover{background:#102840;}")
+        add2.clicked.connect(lambda: self._pcode_add_row(t2))
+        layout.addWidget(add2)
+
+        layout.addStretch()
+        scroll.setWidget(inner_w)
+        outer.addWidget(scroll)
+
+        return tab, tables
+
+    def _pcode_add_row(self, table: QTableWidget):
+        """Append a blank editable row to the given P-code table."""
+        r = table.rowCount()
+        table.insertRow(r)
+        for col, placeholder in enumerate(["0.0000", "0", "0"]):
+            item = QTableWidgetItem(placeholder)
+            item.setForeground(QColor("#ffcc44"))
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            table.setItem(r, col, item)
+        table.editItem(table.item(r, 0))
+
+    def _save_pcode_settings(self, tables: dict):
+        """Collect P-code table edits, confirm changes, and persist to config."""
+        import verifier
+
+        def _read_table(t: QTableWidget) -> dict:
+            out = {}
+            for r in range(t.rowCount()):
+                th_item  = t.item(r, 0)
+                op1_item = t.item(r, 1)
+                op2_item = t.item(r, 2)
+                if not (th_item and op1_item and op2_item):
+                    continue
+                try:
+                    th  = round(float(th_item.text().strip()), 4)
+                    op1 = int(op1_item.text().strip().split()[0])
+                    op2 = int(op2_item.text().strip().split()[0])   # split strips " (was …)" suffix
+                except (ValueError, IndexError):
+                    continue
+                if th > 0 and op1 > 0 and op2 > 0:
+                    out[th] = (op1, op2)
+            return out
+
+        new_l1  = _read_table(tables["lathe1"])
+        new_l23 = _read_table(tables["lathe23"])
+
+        orig_l1  = verifier._DEFAULTS["_LATHE1_PC"]
+        orig_l23 = verifier._DEFAULTS["_LATHE23_PC"]
+
+        change_list = []
+        for th, pair in sorted(new_l1.items()):
+            orig = orig_l1.get(th)
+            if orig != pair:
+                label = f"  Lathe 1  {th:.4f}\":  P{orig[0]}/P{orig[1]} → P{pair[0]}/P{pair[1]}" if orig else \
+                        f"  Lathe 1  {th:.4f}\":  NEW → P{pair[0]}/P{pair[1]}"
+                change_list.append(label)
+        for th, pair in sorted(new_l23.items()):
+            orig = orig_l23.get(th)
+            if orig != pair:
+                label = f"  Lathe 2/3  {th:.4f}\":  P{orig[0]}/P{orig[1]} → P{pair[0]}/P{pair[1]}" if orig else \
+                        f"  Lathe 2/3  {th:.4f}\":  NEW → P{pair[0]}/P{pair[1]}"
+                change_list.append(label)
+
+        if not change_list:
+            return
+
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Confirm P-Code Changes")
+        msg.setIcon(QMessageBox.Icon.Question)
+        msg.setText("You are about to change the following P-code entries:")
+        msg.setInformativeText("\n".join(change_list))
+        msg.setStandardButtons(QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
+        if msg.exec() != QMessageBox.StandardButton.Ok:
+            return
+
+        # Build sparse override dict (only changed/new entries)
+        overrides = {"lathe1": {}, "lathe23": {}}
+        for th, pair in new_l1.items():
+            if orig_l1.get(th) != pair:
+                overrides["lathe1"][f"{th:.4f}"] = list(pair)
+        for th, pair in new_l23.items():
+            if orig_l23.get(th) != pair:
+                overrides["lathe23"][f"{th:.4f}"] = list(pair)
+
+        # Merge with existing config
+        try:
+            existing_cfg = {}
+            if os.path.exists(self.config_path):
+                with open(self.config_path) as f:
+                    existing_cfg = json.load(f)
+        except Exception:
+            existing_cfg = {}
+
+        existing_pc = existing_cfg.get("pcode_overrides", {})
+        existing_pc.get("lathe1",  {}).update(overrides["lathe1"])
+        existing_pc.get("lathe23", {}).update(overrides["lathe23"])
+        if not existing_pc.get("lathe1"):
+            existing_pc["lathe1"]  = overrides["lathe1"]
+        if not existing_pc.get("lathe23"):
+            existing_pc["lathe23"] = overrides["lathe23"]
+        existing_cfg["pcode_overrides"] = existing_pc
+
+        try:
+            with open(self.config_path, "w") as f:
+                json.dump(existing_cfg, f, indent=2)
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to save P-code settings: {e}")
+            return
+
+        verifier.apply_pcode_overrides(overrides)
+        QMessageBox.information(self, "Saved",
+            f"{len(change_list)} P-code change(s) saved and applied immediately.")
 
     def _build_verify_limits_tab(self, parent_dialog: QDialog) -> tuple[QWidget, dict]:
         """Build the Verify Limits settings tab.
@@ -2605,8 +2953,10 @@ class DirectMainWindow(QMainWindow):
         self._bug_list_btn.setChecked(False)   # don't stay toggled — just navigate
 
     def closeEvent(self, event):
-        """Save window state before closing."""
+        """Save window state and checkpoint WAL before closing."""
         self._save_config()
+        if self.db_path:
+            db.checkpoint_and_close(self.db_path)
         super().closeEvent(event)
 
     def _on_settings(self):
@@ -2682,6 +3032,10 @@ class DirectMainWindow(QMainWindow):
         verify_tab, verify_controls = self._build_verify_limits_tab(dlg)
         tabs.addTab(verify_tab, "Verify Limits")
 
+        # --- Tab 3: P-Codes ---
+        pcode_tab, pcode_tables = self._build_pcode_tab()
+        tabs.addTab(pcode_tab, "P-Codes")
+
         # --- Dialog buttons ---
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save |
@@ -2702,6 +3056,9 @@ class DirectMainWindow(QMainWindow):
 
         # Save verify limits (with confirmation)
         self._save_verify_limits(verify_controls)
+
+        # Save P-code changes (with confirmation)
+        self._save_pcode_settings(pcode_tables)
 
     def _save_verify_limits(self, controls: dict):
         """Save verification limit overrides with confirmation dialog.

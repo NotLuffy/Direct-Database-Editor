@@ -10,22 +10,27 @@ active simultaneously and are matched with OR logic.
 """
 
 from PyQt6.QtWidgets import (
-    QWidget, QHBoxLayout, QLabel, QComboBox, QLineEdit, QPushButton, QMenu
+    QWidget, QHBoxLayout, QVBoxLayout, QLabel, QComboBox, QLineEdit,
+    QPushButton, QMenu
 )
-from PyQt6.QtGui import QAction
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtGui import QAction, QStandardItemModel, QStandardItem
+from PyQt6.QtCore import pyqtSignal, QEvent, Qt, QSortFilterProxyModel
 
 _STATUSES = ["All", "active", "flagged", "review", "delete"]
 
 _PART_TYPES = ["All", "Standard", "HC — any", "HC — 15MM",
                "2PC", "2PC HC", "LUG", "STUD", "STEP", "SPACER", "Steel Ring"]
 
+# 2PC piece role (from verify tokens): Recess = has RC, Hub = 0.25" mating hub
+# (HB/IH, not HC), HC = 0.50" hub / 2PC HC.  Helps pull up one half of a pair.
+_TWOPC_ROLES = ["All", "Recess", "Hub", "HC"]
+
 _SCORE_OPTIONS = [
     ("All",    None,  None),
-    ("6",      6,     6),
+    ("8",      8,     8),
+    ("6–7",    6,     7),
     ("4–5",    4,     5),
-    ("2–3",    2,     3),
-    ("0–1",    0,     1),
+    ("0–3",    0,     3),
 ]
 
 _STYLE = """
@@ -39,6 +44,10 @@ QComboBox, QLineEdit {
 QComboBox QAbstractItemView {
     background: #1a1d2e; color: #ccccdd;
     selection-background-color: #2a3055;
+}
+QComboBox QLineEdit {
+    background: #1a1d2e; border: none; color: #ccccdd;
+    padding: 0px 2px; font-size: 11px;
 }
 QPushButton {
     background: #1a1a2e; border: 1px solid #2a2d45;
@@ -57,14 +66,14 @@ _HC = "hc"    # hc_height_in   (float, inches), None = no hub
 
 
 def _rs_key(v):  return round(v, 2)
-def _cb_key(v):  return round(v, 1)
-def _ob_key(v):  return round(v, 1)
+def _cb_key(v):  return round(v, 2)   # 2 decimal places so 66.56 stays distinct from 66.5
+def _ob_key(v):  return round(v, 2)
 def _hc_key(v):  return round(v * 1000)       # nearest-thou integer for bucketing
 
 
 def _rs_label(k): return f"{k:.2f}"
-def _cb_label(k): return f"{k:.1f}"
-def _ob_label(k): return f"{k:.1f}"
+def _cb_label(k): return f"{k:g}"    # :g drops trailing zeros: 66.56→"66.56", 66.0→"66"
+def _ob_label(k): return f"{k:g}"
 
 
 def _th_display_label(th_in: float, from_mm: bool) -> str:
@@ -94,6 +103,82 @@ def _hc_label(k):
     return f'{v:.3f}"'
 
 
+class _AlwaysShowFirstProxy(QSortFilterProxyModel):
+    """Proxy that always shows row 0 ('All') regardless of filter text."""
+    def filterAcceptsRow(self, source_row, source_parent):
+        if source_row == 0:
+            return True
+        return super().filterAcceptsRow(source_row, source_parent)
+
+
+class FilterableComboBox(QComboBox):
+    """Editable combo whose dropdown narrows as the user types.
+    Uses a proxy model so the line edit text is never disturbed by filtering."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._src = QStandardItemModel(self)
+        self._proxy = _AlwaysShowFirstProxy(self)
+        self._proxy.setSourceModel(self._src)
+        self._proxy.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.setModel(self._proxy)
+        self.setEditable(True)
+        self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.setMaxVisibleItems(25)
+        self.setCompleter(None)
+        self.lineEdit().setPlaceholderText("All")
+        self.lineEdit().installEventFilter(self)
+        self.lineEdit().textEdited.connect(self._on_text_edited)
+
+    def eventFilter(self, obj, event):
+        if obj is self.lineEdit() and event.type() == QEvent.Type.MouseButtonPress:
+            if not self.view().isVisible():
+                self.showPopup()
+        return super().eventFilter(obj, event)
+
+    def set_all_items(self, items: list[str], preserve: str | None = None):
+        """Rebuild the full item list, reset the filter, and optionally restore a selection."""
+        self._src.clear()
+        for label in items:
+            self._src.appendRow(QStandardItem(label))
+        self._proxy.setFilterFixedString("")
+        # Clear any typed text (shows placeholder "All")
+        self.blockSignals(True)
+        self.lineEdit().blockSignals(True)
+        self.lineEdit().clear()
+        self.lineEdit().blockSignals(False)
+        self.blockSignals(False)
+        # Re-select preserved value if it's still in the list
+        if preserve and preserve != "All":
+            for i in range(self._src.rowCount()):
+                if self._src.item(i).text() == preserve:
+                    proxy_row = self._proxy.mapFromSource(self._src.index(i, 0)).row()
+                    self.blockSignals(True)
+                    self.lineEdit().blockSignals(True)
+                    self.setCurrentIndex(proxy_row)
+                    self.lineEdit().setText(preserve)
+                    self.lineEdit().blockSignals(False)
+                    self.blockSignals(False)
+                    break
+
+    def _on_text_edited(self, text: str):
+        # Block signals so Qt's model-reset logic can't overwrite the line edit
+        self.blockSignals(True)
+        self.lineEdit().blockSignals(True)
+        self._proxy.setFilterFixedString(text)
+        # Restore typed text (Qt may have clobbered it when currentIndex changed)
+        self.lineEdit().setText(text)
+        self.lineEdit().setCursorPosition(len(text))
+        self.lineEdit().blockSignals(False)
+        self.blockSignals(False)
+        if not self.view().isVisible():
+            self.showPopup()
+
+    def currentText(self) -> str:
+        t = super().currentText().strip()
+        return t if t else "All"
+
+
 class FilterBar(QWidget):
 
     filters_changed = pyqtSignal(dict)
@@ -101,7 +186,7 @@ class FilterBar(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setStyleSheet(_STYLE)
-        self.setFixedHeight(34)
+        self.setFixedHeight(62)   # two rows
         self._building = False
         # Each entry: {rs, cb, ob, th, hc_in}  (values may be None)
         self._specs: list[dict] = []
@@ -109,6 +194,11 @@ class FilterBar(QWidget):
         self._thick_selections: set[str] = set()
         # All available MM thickness labels (for menu rebuild)
         self._thick_all_labels: list[str] = []
+        # Cached 2PC token value lists (for repopulating after reset)
+        self._rc_values_cache: list = []
+        self._step_values_cache: list = []
+        self._cbore_values_cache: list = []
+        self._hb_values_cache: list = []
         self._build()
 
     # ------------------------------------------------------------------
@@ -117,46 +207,61 @@ class FilterBar(QWidget):
 
     def _build(self):
         self._building = True
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(6, 2, 6, 2)
-        lay.setSpacing(6)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(6, 2, 6, 2)
+        root.setSpacing(3)
+        row1 = QHBoxLayout(); row1.setSpacing(6)
+        row2 = QHBoxLayout(); row2.setSpacing(6)
+        root.addLayout(row1)
+        root.addLayout(row2)
 
-        def lbl(text):
+        def lbl(text, row):
             l = QLabel(text)
-            lay.addWidget(l)
+            row.addWidget(l)
             return l
 
-        def combo(items, width=90, on_change=None):
+        def combo(items, row, width=90, on_change=None):
             c = QComboBox()
             c.addItems(items)
             c.setFixedWidth(width)
             c.currentIndexChanged.connect(on_change or self._emit)
-            lay.addWidget(c)
+            row.addWidget(c)
             return c
 
-        lbl("Status:")
-        self._status_combo = combo(_STATUSES, 90)
+        def filterable(row, width=78, on_change=None):
+            c = FilterableComboBox()
+            c.setFixedWidth(width)
+            c.set_all_items(["All"])
+            cb = on_change or self._emit
+            c.currentIndexChanged.connect(cb)
+            c.lineEdit().editingFinished.connect(cb)
+            row.addWidget(c)
+            return c
 
-        lbl("Dup:")
-        self._dup_combo = combo(["All", "Dups only", "No dups"], 90)
+        # ── Row 1 — general + title-spec filters ─────────────────────────────
+        lbl("Status:", row1)
+        self._status_combo = combo(_STATUSES, row1, 90)
 
-        lbl("Score:")
-        self._score_combo = combo([o[0] for o in _SCORE_OPTIONS], 70)
+        lbl("Dup:", row1)
+        self._dup_combo = combo(["All", "Dups only", "No dups"], row1, 90)
 
-        lbl("Round:")
-        self._round_combo = combo(["All"], 76,
-                                  on_change=self._on_spec_changed)
+        lbl("Score:", row1)
+        self._score_combo = combo([o[0] for o in _SCORE_OPTIONS], row1, 70)
 
-        lbl("CB mm:")
-        self._cb_combo = combo(["All"], 76,
-                               on_change=self._on_spec_changed)
+        lbl("Type:", row1)
+        self._type_combo = combo(_PART_TYPES, row1, 100)
 
-        lbl("OB mm:")
-        self._ob_combo = combo(["All"], 76,
-                               on_change=self._on_spec_changed)
+        lbl("Round:", row1)
+        self._round_combo = combo(["All"], row1, 76, on_change=self._on_spec_changed)
+
+        lbl("CB mm:", row1)
+        self._cb_combo = filterable(row1, 84, self._on_spec_changed)
+
+        lbl("OB mm:", row1)
+        self._ob_combo = filterable(row1, 84, self._on_spec_changed)
 
         # Thickness — multi-select button + checkable menu
-        lbl("Thick:")
+        lbl("Thick:", row1)
         self._thick_btn = QPushButton("All ▾")
         self._thick_btn.setFixedWidth(148)
         self._thick_btn.setStyleSheet(
@@ -172,26 +277,44 @@ class FilterBar(QWidget):
             "QMenu::item { padding: 3px 20px 3px 6px; font-size: 11px; }"
         )
         self._thick_btn.clicked.connect(self._show_thick_menu)
-        lay.addWidget(self._thick_btn)
+        row1.addWidget(self._thick_btn)
 
-        lbl("Hub:")
-        self._hub_combo = combo(["All", "No Hub"], 96,
+        lbl("Hub:", row1)
+        self._hub_combo = combo(["All", "No Hub"], row1, 96,
                                 on_change=self._on_spec_changed)
+        row1.addStretch()
 
-        lbl("Type:")
-        self._type_combo = combo(_PART_TYPES, 100)
+        # ── Row 2 — 2PC / step value filters + search ────────────────────────
+        # 2PC pairing group: role + recess + hub together
+        lbl("2PC:", row2)
+        self._twopc_combo = combo(_TWOPC_ROLES, row2, 84)
 
-        lbl("Search:")
+        lbl("RC:", row2)          # recess value (RC token, inches)
+        self._rc_combo = filterable(row2, 78)
+
+        lbl("HB:", row2)          # hub OD (HB token, inches)
+        self._hb_combo = filterable(row2, 78)
+
+        row2.addSpacing(16)
+        # STEP group: depth + counterbore
+        lbl("Step:", row2)        # step depth (SD token, inches)
+        self._step_combo = combo(["All"], row2, 74)
+
+        lbl("CBore:", row2)       # counterbore value (mm) — step_mm / STEP token
+        self._cbore_combo = filterable(row2, 78)
+
+        row2.addSpacing(16)
+        lbl("Search:", row2)
         self._search_edit = QLineEdit()
         self._search_edit.setPlaceholderText("O-number, title, path, notes…")
-        self._search_edit.setMinimumWidth(140)
+        self._search_edit.setMinimumWidth(160)
         self._search_edit.textChanged.connect(self._emit)
-        lay.addWidget(self._search_edit)
+        row2.addWidget(self._search_edit, stretch=1)
 
         reset_btn = QPushButton("Reset")
         reset_btn.setFixedWidth(52)
         reset_btn.clicked.connect(self.reset)
-        lay.addWidget(reset_btn)
+        row2.addWidget(reset_btn)
 
         self._building = False
 
@@ -208,6 +331,43 @@ class FilterBar(QWidget):
                        if any(s.get(k) is not None
                               for k in (_RS, _CB, _OB, _TH, "hc_in"))]
         self._cascade()
+
+    def set_twopc_values(self, rc_values: list, step_depths: list,
+                         cbore_values: list = None, hb_values: list = None):
+        """Populate the RC / Step / Counterbore / HB dropdowns from verify-token
+        values present in the data.  RC, Step, HB are inches; Counterbore is mm."""
+        cbore_values = cbore_values or []
+        hb_values    = hb_values or []
+        self._rc_values_cache    = list(rc_values)
+        self._step_values_cache  = list(step_depths)
+        self._cbore_values_cache = list(cbore_values)
+        self._hb_values_cache    = list(hb_values)
+
+        rc_prev = self._sel(self._rc_combo)
+        rc_items = ["All"] + [f'{v:.3f}"'
+                              for v in sorted({round(x, 3) for x in rc_values})]
+        self._rc_combo.set_all_items(rc_items, preserve=rc_prev)
+
+        cb_prev = self._sel(self._cbore_combo)
+        cbore_items = ["All"] + [f"{v:g}"
+                                 for v in sorted({round(x, 1) for x in cbore_values})]
+        self._cbore_combo.set_all_items(cbore_items, preserve=cb_prev)
+
+        hb_prev = self._sel(self._hb_combo)
+        hb_items = ["All"] + [f'{v:.3f}"'
+                             for v in sorted({round(x, 3) for x in hb_values})]
+        self._hb_combo.set_all_items(hb_items, preserve=hb_prev)
+
+        self._step_combo.blockSignals(True)
+        step_prev = self._step_combo.currentText()
+        self._step_combo.clear()
+        step_items = ["All"] + [f'{v:.3f}"'
+                                for v in sorted({round(x, 3) for x in step_depths})]
+        for it in step_items:
+            self._step_combo.addItem(it)
+        if step_prev in step_items:
+            self._step_combo.setCurrentText(step_prev)
+        self._step_combo.blockSignals(False)
 
     # ------------------------------------------------------------------
     # Cascade helpers
@@ -238,14 +398,14 @@ class FilterBar(QWidget):
             if cb_sel is not None:
                 sv = s.get(_CB)
                 try:
-                    if sv is None or abs(_cb_key(sv) - float(cb_sel)) > 0.05:
+                    if sv is None or abs(_cb_key(sv) - float(cb_sel)) > 0.005:
                         continue
                 except (ValueError, TypeError):
                     continue
             if ob_sel is not None:
                 sv = s.get(_OB)
                 try:
-                    if sv is None or abs(_ob_key(sv) - float(ob_sel)) > 0.05:
+                    if sv is None or abs(_ob_key(sv) - float(ob_sel)) > 0.005:
                         continue
                 except (ValueError, TypeError):
                     continue
@@ -283,15 +443,14 @@ class FilterBar(QWidget):
                         fixed_top: list[str] | None = None):
         """Refill combo with fixed_top items + sorted unique labels,
         restoring the previous selection if it still exists."""
+        all_items = ["All"] + (fixed_top or []) + [label_fn(v) for v in raw_vals]
+        if isinstance(combo, FilterableComboBox):
+            combo.set_all_items(all_items, preserve=preserve)
+            return
         combo.blockSignals(True)
         combo.clear()
-        combo.addItem("All")
-        if fixed_top:
-            for item in fixed_top:
-                combo.addItem(item)
-        for v in raw_vals:
-            combo.addItem(label_fn(v))
-        all_items = ["All"] + (fixed_top or []) + [label_fn(v) for v in raw_vals]
+        for item in all_items:
+            combo.addItem(item)
         if preserve and preserve in all_items:
             combo.setCurrentText(preserve)
         combo.blockSignals(False)
@@ -421,6 +580,21 @@ class FilterBar(QWidget):
         pt_text   = self._type_combo.currentText()
         part_type = "" if pt_text == "All" else pt_text
 
+        tp_text     = self._twopc_combo.currentText()
+        twopc_role  = "" if tp_text == "All" else tp_text
+
+        def _val(text):
+            if not text or text == "All":
+                return None
+            try:
+                return float(text.replace('"', "").strip())
+            except ValueError:
+                return None
+        rc_value    = _val(self._sel(self._rc_combo))
+        step_depth  = _val(self._step_combo.currentText())
+        cbore_value = _val(self._sel(self._cbore_combo))   # mm
+        hb_value    = _val(self._sel(self._hb_combo))      # inches
+
         # Hub height: "All"→None, "No Hub"→"none", label→inch float string
         hc_text = self._sel(self._hub_combo)
         if hc_text is None:
@@ -450,6 +624,11 @@ class FilterBar(QWidget):
             "thickness":    thickness,   # list[str] | None  e.g. ["20.0MM", "25.4MM"]
             "hub_height":   hub_height,
             "part_type":    part_type,
+            "twopc_role":   twopc_role,
+            "rc_value":     rc_value,     # recess diameter (in) | None
+            "step_depth":   step_depth,   # step depth (in) | None
+            "cbore_value":  cbore_value,  # counterbore diameter (mm) | None
+            "hb_value":     hb_value,     # hub OD (in) | None
             "search":       self._search_edit.text().strip(),
         }
 
@@ -459,13 +638,21 @@ class FilterBar(QWidget):
         self._dup_combo.setCurrentIndex(0)
         self._score_combo.setCurrentIndex(0)
         self._round_combo.setCurrentIndex(0)
-        self._cb_combo.setCurrentIndex(0)
-        self._ob_combo.setCurrentIndex(0)
+        self._cb_combo.set_all_items(getattr(self._cb_combo, "_all_items", ["All"]))
+        self._ob_combo.set_all_items(getattr(self._ob_combo, "_all_items", ["All"]))
         self._thick_selections.clear()
         self._update_thick_btn_label()
         self._hub_combo.setCurrentIndex(0)
         self._type_combo.setCurrentIndex(0)
+        self._twopc_combo.setCurrentIndex(0)
+        self._step_combo.setCurrentIndex(0)
+        # Clear the typeable value combos so set_twopc_values doesn't preserve them
+        for c in (self._rc_combo, self._cbore_combo, self._hb_combo):
+            c.lineEdit().clear()
         self._search_edit.clear()
         self._building = False
+        # Repopulate RC/Step/CBore/HB value lists from cache (selections now cleared)
+        self.set_twopc_values(self._rc_values_cache, self._step_values_cache,
+                              self._cbore_values_cache, self._hb_values_cache)
         self._cascade()   # re-populate all spec combos with the full unfiltered option sets
         self._emit()

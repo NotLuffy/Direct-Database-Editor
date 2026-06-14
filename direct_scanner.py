@@ -43,6 +43,8 @@ _DERIVED_RE = re.compile(
     r'^\s*\(\s*(?:MADE\s+FROM|CHANGED\s+FROM|COPY\s+OF|FROM)\s+(O\d{4,6}(?:_\d+)?)\s*\)',
     re.IGNORECASE
 )
+# Programmer sign-off comment: (RH 04/08/2026) or (RH 4-8-26) etc. in first 5 lines
+_RH_RE = re.compile(r'^\s*\(\s*RH\s+([\d/\-\.]+)\s*\)', re.IGNORECASE)
 
 # Tags written by this scanner — stripped before each rescan
 _AUTO_TAG_RE = re.compile(
@@ -111,6 +113,21 @@ def _extract_header_info(chunk: bytes) -> tuple[str, str, str, bool]:
         if not stripped.startswith("("):
             break
     return title, derived_from, internal_o, has_gcode
+
+
+def _extract_rh_date(path: str) -> str:
+    """Return the date from an (RH MM/DD/YYYY) programmer sign-off in the first 5 lines, or ''."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i >= 5:
+                    break
+                m = _RH_RE.match(line.strip())
+                if m:
+                    return m.group(1).strip()
+    except Exception:
+        pass
+    return ""
 
 
 def _count_lines(path: str) -> int:
@@ -198,6 +215,11 @@ def _process_one(path: str, source_folder: str,
         except Exception:
             score, vstatus = 0, ""
 
+        # ── Programmer sign-off: (RH MM/DD/YYYY) in first 5 lines ──────────
+        rh_date = _extract_rh_date(path)
+        if rh_date:
+            vstatus = (vstatus + " RH:PASS").strip() if vstatus else "RH:PASS"
+
         # ── Safeguard 1: filename O-number ≠ internal O-number ─────────────
         has_onum_mismatch = 1 if (internal_o and internal_o != o_number.upper()) else 0
 
@@ -238,6 +260,10 @@ def _process_one(path: str, source_folder: str,
             base_notes = (
                 f"[RANGE CONFLICT] {range_msg}\n" + base_notes
             ).strip()
+
+        # Record RH sign-off date in notes (persists; not auto-stripped on rescan)
+        if rh_date and f"[RH: {rh_date}]" not in base_notes:
+            base_notes = (f"[RH: {rh_date}]\n" + base_notes).strip()
 
         return {
             "file_path":         path,
@@ -341,10 +367,10 @@ def _run_dedup_passes(records_by_path: dict, db_path: str,
             if m["file_path"] == rec_keep["file_path"]:
                 tag = (f"[DUP:exact] {len(members)-1} identical "
                        f"cop{'ies' if len(members)>2 else 'y'} found. "
-                       f"This file is the recommended keep (score {rec_score}/7).")
+                       f"This file is the recommended keep (score {rec_score}/8).")
             else:
                 tag = (f"[DUP:exact] Same content as {rec_name} "
-                       f"(score {rec_score}/7). Recommended keep: {rec_keep['file_path']}")
+                       f"(score {rec_score}/8). Recommended keep: {rec_keep['file_path']}")
             _append_dup_note(m, tag)
             db_conn.execute(
                 "UPDATE files SET notes=?, has_dup_flag=1 WHERE file_path=?",
@@ -378,12 +404,12 @@ def _run_dedup_passes(records_by_path: dict, db_path: str,
             if m["file_path"] == rec_keep["file_path"]:
                 tag = (f"[DUP:conflict] {len(members)-1} file(s) share O-number {onum} "
                        f"with different content. This is the recommended keep "
-                       f"(score {rec_keep['verify_score']}/7).")
+                       f"(score {rec_keep['verify_score']}/8).")
             else:
                 tag = (f"[DUP:conflict] Same O-number {onum}, different content. "
-                       f"Score: {m['verify_score']}/7. "
+                       f"Score: {m['verify_score']}/8. "
                        f"Recommended keep: {rec_keep['file_path']} "
-                       f"(score {rec_keep['verify_score']}/7).")
+                       f"(score {rec_keep['verify_score']}/8).")
             _append_dup_note(m, tag)
             db_conn.execute(
                 "UPDATE files SET notes=?, has_dup_flag=1 WHERE file_path=?",
@@ -419,13 +445,13 @@ def _run_dedup_passes(records_by_path: dict, db_path: str,
             if m["file_path"] == rec_keep["file_path"]:
                 tag = (f"[DUP:backup_chain] Backup chain for {onum}. "
                        f"{len(members)} files total. "
-                       f"This is the recommended keep (score {m['verify_score']}/7).")
+                       f"This is the recommended keep (score {m['verify_score']}/8).")
             else:
                 tag = (f"[DUP:backup_chain] Backup chain for {onum}. "
                        f"{len(members)} files total. "
                        f"Recommended keep: {rec_keep['file_path']} "
-                       f"(score {rec_keep['verify_score']}/7). "
-                       f"Your score: {m['verify_score']}/7.")
+                       f"(score {rec_keep['verify_score']}/8). "
+                       f"Your score: {m['verify_score']}/8.")
             _append_dup_note(m, tag)
             db_conn.execute(
                 "UPDATE files SET notes=?, has_dup_flag=1 WHERE file_path=?",
@@ -455,8 +481,8 @@ def _run_dedup_passes(records_by_path: dict, db_path: str,
             continue
         tag = (f"[DUP:derived] Derived from {derived}. "
                f"Original: {orig['file_path']} "
-               f"(score {orig['verify_score']}/7). "
-               f"This file score: {r['verify_score']}/7.")
+               f"(score {orig['verify_score']}/8). "
+               f"This file score: {r['verify_score']}/8.")
         _append_dup_note(r, tag)
         db_conn.execute(
             "UPDATE files SET notes=?, has_dup_flag=1 WHERE file_path=?",
@@ -495,7 +521,7 @@ def _run_dedup_passes(records_by_path: dict, db_path: str,
                 tag = (f"[DUP:title_match] Same program title as {rec_keep['o_number']} "
                        f"({rec_keep['file_path']}). "
                        f"Scores: this={m['verify_score']}/7, "
-                       f"other={rec_keep['verify_score']}/7.")
+                       f"other={rec_keep['verify_score']}/8.")
                 _append_dup_note(m, tag)
                 db_conn.execute(
                     "UPDATE files SET notes=?, has_dup_flag=1 WHERE file_path=?",

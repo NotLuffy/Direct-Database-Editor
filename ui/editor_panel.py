@@ -141,12 +141,12 @@ class _CodeEditor(QPlainTextEdit):
 
 class _ScoreBadge(QLabel):
 
-    _COLORS = {7: "#44dd88", 6: "#aadd44", 5: "#aadd44",
-               4: "#ffaa33", 3: "#ffaa33", 2: "#ff5555", 1: "#ff5555", 0: "#ff5555"}
+    _COLORS = {8: "#44dd88", 7: "#44dd88", 6: "#aadd44",
+               5: "#aadd44", 4: "#ffaa33", 3: "#ffaa33", 2: "#ff5555", 1: "#ff5555", 0: "#ff5555"}
 
     def set_score(self, score: int, verify_status: str = ""):
         color = self._COLORS.get(score, "#888888")
-        self.setText(f"  Score: {score}/7  ")
+        self.setText(f"  Score: {score}/8  ")
         self.setStyleSheet(
             f"color:{color}; font-weight:bold; font-size:13px; "
             f"border:1px solid {color}55; border-radius:4px; padding:2px 6px;"
@@ -860,6 +860,72 @@ class EditorPanel(QWidget):
             cb_detail += f"\nFinish feed: {f_str} (max F0.015) [{status}]"
         cb_ln = result.get("cb_context_hit_ln")
         self._vp_check_row("CB  (Center Bore)", cb_ok, cb_detail, cb_ln)
+
+        # ── Rough Bore (T121 step check) ──
+        rb_pass_xs      = result.get("rb_pass_xs") or []
+        rb_steps_ok     = result.get("rb_steps_ok")
+        rb_start_ok     = result.get("rb_start_ok")
+        rb_max_step     = result.get("rb_max_step")
+        rb_viols        = result.get("rb_violations") or []
+        rb_skip         = result.get("rb_skip_cb", False)
+        rb_approach     = result.get("rb_approach_x")
+        rb_deep_ok      = result.get("rb_deep_ok")
+        rb_deep_v       = result.get("rb_deep_violations") or []
+        rb_chamfer_ok   = result.get("rb_chamfer_x_ok")
+        rb_chamfer_xs   = result.get("rb_chamfer_x_found") or []
+
+        if rb_pass_xs or rb_steps_ok is not None or rb_start_ok is not None:
+            # Overall ok = start ok AND steps ok AND chamfer X ok
+            if rb_steps_ok is False or rb_start_ok is False or rb_chamfer_ok is False:
+                rb_overall = False
+            elif rb_steps_ok is True or rb_start_ok is True:
+                rb_overall = True
+            else:
+                rb_overall = None
+
+            rb_lines = []
+
+            # Approach X
+            if rb_approach is not None:
+                flag = "" if rb_start_ok is not False else "  ← TOO HIGH"
+                rb_lines.append(f"Approach X: {rb_approach:.4f}\"{flag}  (valid: X2.0–X2.3)")
+            elif not rb_skip:
+                rb_lines.append("Approach X: not found")
+
+            # Pass list
+            if rb_pass_xs:
+                xs_str = "  ".join(f"X{x:.3f}" for x in rb_pass_xs)
+                rb_lines.append(f"Passes ({len(rb_pass_xs)}):  {xs_str}")
+
+            # Chamfer pass info
+            if rb_chamfer_xs:
+                cxs_str = "  ".join(f"X{x:.3f}" for x in rb_chamfer_xs)
+                if rb_chamfer_ok is False:
+                    rb_lines.append(f"Chamfer pass: {cxs_str}  ← EXCEEDS CB+0.300\"")
+                else:
+                    rb_lines.append(f"Chamfer pass: {cxs_str}  (exempt from step rule)")
+
+            # Step check
+            if rb_steps_ok is True:
+                rb_lines.append(f"Steps OK — max increment {rb_max_step:.4f}\"  (limit 0.300\")")
+            elif rb_steps_ok is False:
+                for x1, x2, step in rb_viols:
+                    rb_lines.append(f"STEP VIOLATION: X{x1:.3f} → X{x2:.3f}  +{step:.4f}\"  (limit 0.300\")")
+            elif rb_skip:
+                rb_lines.append("Step check: N/A  (CB < 58mm, no roughing needed)")
+            else:
+                rb_lines.append("Steps: only 1 pass found — cannot check increments")
+
+            # Deep-pass check
+            if rb_deep_ok is True:
+                rb_lines.append("Deep passes (X>6.8\"): Z decreasing  OK")
+            elif rb_deep_ok is False:
+                for x_p, z_p, x_c, z_c, *_ in rb_deep_v:
+                    rb_lines.append(
+                        f"DEEP VIOLATION: X{x_p:.3f} Z{z_p:.4f} → X{x_c:.3f} Z{z_c:.4f}  (Z must decrease)")
+
+            self._vp_check_row("RB  (Rough Bore)", rb_overall,
+                               "\n".join(rb_lines), None)
 
         # ── OB ──
         ob_ok = result.get("ob_ok")

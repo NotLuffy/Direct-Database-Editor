@@ -81,7 +81,7 @@ _STEEL_RING_RE = re.compile(
 _TITLE_SPEC_RE = re.compile(
     r'(\d+(?:\.\d+)?)'                              # group 1: round size
     r'(?:\s*(?:IN[$*D]?|[$*"]))?'                   # optional attached unit: IN, IN$, IN*, IND, $, *, "
-    r'(?:\s+(?:IN\$?|DIA\b|LUG\b|HC\b))*'            # optional spaced keywords (repeatable): IN, DIA, LUG, HC
+    r'(?:\s+(?:IN\$?|DIA\b|LUG\b|HC\b|15\s*MM\s*HC\b))*'  # optional spaced keywords: IN, DIA, LUG, HC, 15MMHC
     r'\s*(?:-\s*)?'                                  # optional dash separator (e.g. "IND - 133MM")
     r'(\d+(?:\.\d+)?)'                              # group 2: CB mm (required)
     r'(?:[A-Za-z"]*\s*[/\-]\s*(\d+(?:\.\d+)?))?'  # group 3: optional OB (allow " before /)
@@ -123,15 +123,21 @@ _CHAMFER_CB_RE = re.compile(
 _CHAMFER_Z_MAX_IN = 0.35   # larger Z depths are boring passes, not chamfers
 
 # Rough bore pass checker constants
-_RB_START_LIMIT = 2.3   # approach X must be < 2.4 to be "good"
-_RB_FLAG_X      = 2.4   # flag if approach X >= this (if CB >= 58mm)
-_RB_STEP_LIMIT  = 0.3   # max X increment between consecutive bore passes (inches)
-_RB_CB_SKIP_MM  = 58.0  # skip start check when CB < this (going straight to CB)
-_RB_DEEP_X      = 6.8   # passes at or beyond this X must have decreasing Z depth
+_RB_START_LIMIT   = 2.3   # approach X must be < 2.4 to be "good"
+_RB_FLAG_X        = 2.4   # flag if approach X >= this (if CB >= 58mm)
+_RB_STEP_LIMIT    = 0.3   # max X increment between consecutive bore passes (inches)
+_RB_CB_SKIP_MM    = 58.0  # skip start check when CB < this (going straight to CB)
+_RB_DEEP_X        = 6.8   # passes at or beyond this X must have decreasing Z depth
+# Chamfer pass identification: a shallow Z-plunge (Z ≈ -0.15") just before the final CB pass.
+# The chamfer X is allowed to exceed CB_X — it is the ONLY exception to the 0.3" step rule.
+# The chamfer X must not exceed CB_X (radius) + 0.3".
+_RB_CHAMFER_Z_MIN = -0.30  # chamfer Z range floor (anything shallower than this is chamfer)
+_RB_CHAMFER_Z_MAX = -0.05  # chamfer Z range ceiling (deeper than this is a real bore pass)
 
 # HC height in title: "HC 1", "HC 1.5", "HC .75", "HC1.5" (no space) — hub height in inches
 # \d*\.?\d+ handles both "1.5" and ".75" (leading dot); \s* allows no-space like "HC1.5"
-_HC_HEIGHT_RE  = re.compile(r'\bHC\s*(\d*\.?\d+)',  re.IGNORECASE)
+# Negative lookahead (?!\s*PC\b) prevents "HC 2PC" from being parsed as HC height=2"
+_HC_HEIGHT_RE  = re.compile(r'\bHC\s*(\d*\.?\d+)(?!\s*PC\b)',  re.IGNORECASE)
 # 15MM HC: special drill-depth case — always Z-1.15" regardless of part thickness
 # \s* allows "15MMHC" with no spaces
 _HC_15MM_RE    = re.compile(r'\b15\s*MM\s*HC\b',    re.IGNORECASE)
@@ -219,7 +225,7 @@ _OD_TABLE = {
      9.50:  9.450,
     10.25: 10.170,
     10.50: 10.450,
-    13.00: 12.903,
+    13.00: 12.901,
 }
 
 # ---------------------------------------------------------------------------
@@ -286,7 +292,7 @@ _TURNING_Z_TABLE = {
     round(20  / 25.4, 4):  -0.35,   # 20MM = 0.7874"
     round(22  / 25.4, 4):  -0.35,   # 22MM = 0.8661"
     1.00:   -0.55,
-    1.25:   -0.66,
+    1.25:   -0.70,
     1.50:   -0.80,
     1.75:   -0.925,
     2.00:   -1.05,
@@ -313,6 +319,10 @@ _DEFAULTS = {
 # Also store original _OD_TABLE and _TURNING_Z_TABLE by creating a snapshot
 _DEFAULTS["_OD_TABLE"] = dict(_OD_TABLE) if '_OD_TABLE' in dir() else {}
 _DEFAULTS["_TURNING_Z_TABLE"] = dict(_TURNING_Z_TABLE)
+# Snapshot original P-code tables so the settings UI can show original vs current
+_DEFAULTS["_LATHE1_PC"]    = dict(_LATHE1_PC)
+_DEFAULTS["_LATHE23_PC"]   = dict(_LATHE23_PC)
+_DEFAULTS["_LATHE1_ALT_PC"] = dict(_LATHE1_ALT_PC)
 
 
 def apply_overrides(overrides: dict):
@@ -355,6 +365,27 @@ def apply_overrides(overrides: dict):
                 _OD_TABLE[rs] = float(v)
             except (ValueError, KeyError):
                 pass
+
+
+def apply_pcode_overrides(overrides: dict):
+    """Patch _LATHE1_PC and _LATHE23_PC with user-configured P-code entries.
+
+    overrides format: {"lathe1": {"0.75": [13, 14], ...}, "lathe23": {"1.00": [5, 6], ...}}
+    Missing keys keep their hardcoded defaults.
+    """
+    global _LATHE1_PC, _LATHE23_PC
+    if not overrides:
+        return
+    for k, v in overrides.get("lathe1", {}).items():
+        try:
+            _LATHE1_PC[round(float(k), 4)] = (int(v[0]), int(v[1]))
+        except (ValueError, IndexError, TypeError):
+            pass
+    for k, v in overrides.get("lathe23", {}).items():
+        try:
+            _LATHE23_PC[round(float(k), 4)] = (int(v[0]), int(v[1]))
+        except (ValueError, IndexError, TypeError):
+            pass
 
 
 def _turning_z_limit(disc_thickness_in: float) -> float | None:
@@ -488,7 +519,18 @@ def parse_title_specs(title: str) -> dict | None:
     _format_c_ob_mm = None          # OB converted from inches in Format C
     if cb_mm < 15.0:
         ob_candidate = float(m.group(3)) if m.group(3) else None
-        if ob_candidate is not None and ob_candidate > 15.0:
+        # Inch-marked CB: "5.47IN/220MM" or '5.25"/220MM' — the first value carries
+        # an explicit IN/" unit, so it is the centerbore in inches (convert ×25.4),
+        # NOT a disc thickness.  The second value (group 3) is the OB in mm.
+        # (Same convention Format B applies below: a value immediately followed by
+        # IN is a bore label, not a disc thickness.)  Without this, Format A would
+        # treat the inch CB as thickness and wrongly promote the OB into the CB.
+        _cb_unit = title[m.end(2):m.end(2) + 4]
+        _cb_in_marked = bool(re.match(r'\s*(?:IN\b|")', _cb_unit, re.IGNORECASE))
+        if _cb_in_marked and 0.4 < cb_mm <= 12.0:
+            # group 3 (the OB in mm) is picked up by the OB logic further down.
+            cb_mm = round(cb_mm * 25.4, 3)
+        elif ob_candidate is not None and ob_candidate > 15.0:
             # Format A: OB slot held the real CB; first value was disc thickness
             _thickness_override_in = cb_mm
             cb_mm = ob_candidate
@@ -873,9 +915,11 @@ def _find_rough_bore(pre_flip_lines: list, cb_mm: float) -> dict:
       rb_pass_zs        — list of Z depths (negative floats) at each bore pass
       rb_pass_fs        — list of modal F values at each bore pass (float or None)
       rb_start_ok       — True if approach_x < _RB_FLAG_X; None if skip or NF
-      rb_steps_ok       — True if all consecutive increments ≤ _RB_STEP_LIMIT; None if <2 passes
-      rb_max_step       — largest step found (float or None)
-      rb_violations     — list of (x1, x2, step) tuples exceeding step limit
+      rb_steps_ok       — True if all non-chamfer increments ≤ _RB_STEP_LIMIT; None if <2 passes
+      rb_max_step       — largest positive step found (float or None)
+      rb_violations     — list of (x1, x2, step) tuples exceeding step limit (chamfer steps excluded)
+      rb_chamfer_x_ok   — True if chamfer X ≤ cb_diameter_in + 0.3"; None if no chamfer pass found
+      rb_chamfer_x_found — list of X values at chamfer passes (Z ≈ -0.15")
       rb_skip_cb        — True if CB < 58mm (start check not applicable)
       rb_deep_ok        — True if all passes beyond X6.8 have decreasing Z depth; None if N/A
       rb_deep_violations — list of (x_prev, z_prev, x_curr, z_curr) tuples where Z didn't decrease
@@ -972,19 +1016,49 @@ def _find_rough_bore(pre_flip_lines: list, cb_mm: float) -> dict:
     else:
         rb_start_ok = None   # not found
 
-    # Step check (requires at least 2 passes)
-    rb_steps_ok   = None
-    rb_max_step   = None
-    rb_violations = []
-    if len(pass_xs) >= 2:
-        steps = [pass_xs[i + 1] - pass_xs[i] for i in range(len(pass_xs) - 1)]
-        rb_max_step   = max(steps)
-        rb_violations = [
-            (pass_xs[i], pass_xs[i + 1], steps[i])
-            for i in range(len(steps))
-            if steps[i] > _RB_STEP_LIMIT + 1e-9   # epsilon handles floating-point (e.g. 2.6-2.3=0.3000...027)
-        ]
-        rb_steps_ok = len(rb_violations) == 0
+    # Step check — approach → first pass AND between every consecutive pass must be ≤ 0.3"
+    # Valid start: approach X anywhere from 2.0–2.3 (< 2.4); increments of 0.3 or less from there.
+    # Exception: one chamfer pass (Z between _RB_CHAMFER_Z_MIN and _RB_CHAMFER_Z_MAX, i.e. ≈ -0.15")
+    # is allowed to be any X ≤ cb_x_in + 0.3"; the step INTO that pass is exempt from the 0.3" rule.
+    rb_steps_ok        = None
+    rb_max_step        = None
+    rb_violations      = []
+    rb_chamfer_x_ok    = None
+    rb_chamfer_x_found = []
+
+    cb_x_in = cb_mm / 25.4   # CB diameter mm → diameter in inches (X is diameter in HAAS lathe)
+
+    if len(pass_xs) >= 1:
+        seq   = ([approach_x] + pass_xs)   if approach_x is not None else list(pass_xs)
+        seq_z = ([None]       + pass_zs)   if approach_x is not None else list(pass_zs)
+
+        # Identify which indices in seq are chamfer passes
+        chamfer_dest_idxs = set()
+        for si in range(len(seq)):
+            z = seq_z[si]
+            if z is not None and _RB_CHAMFER_Z_MIN <= z <= _RB_CHAMFER_Z_MAX:
+                chamfer_dest_idxs.add(si)
+                rb_chamfer_x_found.append(seq[si])
+
+        if len(seq) >= 2:
+            steps = [seq[i + 1] - seq[i] for i in range(len(seq) - 1)]
+            # Max step excludes chamfer-destination steps (those are exempt and reported separately)
+            non_chamfer_steps = [steps[i] for i in range(len(steps)) if (i + 1) not in chamfer_dest_idxs]
+            positive_nc = [s for s in non_chamfer_steps if s > 0]
+            rb_max_step = max(positive_nc) if positive_nc else 0.0
+            rb_violations = [
+                (seq[i], seq[i + 1], steps[i])
+                for i in range(len(steps))
+                # destination is a chamfer pass → exempt from step limit
+                if (i + 1) not in chamfer_dest_idxs
+                and steps[i] > _RB_STEP_LIMIT + 1e-9
+            ]
+            rb_steps_ok = len(rb_violations) == 0
+
+    # Validate chamfer X ≤ cb_x_in + 0.3" (the only allowed overshoot)
+    if rb_chamfer_x_found:
+        bad_chamfer = [x for x in rb_chamfer_x_found if x > cb_x_in + _RB_STEP_LIMIT + 1e-9]
+        rb_chamfer_x_ok = len(bad_chamfer) == 0
 
     # Deep-pass check: passes at or beyond X6.8 must have strictly decreasing Z depth.
     # Once the bore has widened past _RB_DEEP_X the Z plunge must get shallower each pass
@@ -1034,21 +1108,23 @@ def _find_rough_bore(pre_flip_lines: list, cb_mm: float) -> dict:
                 rb_rough_f_ok = all(f <= _RB_ROUGH_F + _RB_F_TOL for f in rough_fs)
 
     return {
-        "rb_approach_x":      approach_x,
-        "rb_pass_xs":         pass_xs,
-        "rb_pass_zs":         pass_zs,
-        "rb_pass_lns":        pass_lns,
-        "rb_pass_fs":         pass_fs,
-        "rb_start_ok":        rb_start_ok,
-        "rb_steps_ok":        rb_steps_ok,
-        "rb_max_step":        rb_max_step,
-        "rb_violations":      rb_violations,
-        "rb_skip_cb":         skip_cb,
-        "rb_deep_ok":         rb_deep_ok,
-        "rb_deep_violations": rb_deep_violations,
-        "rb_rough_f_ok":      rb_rough_f_ok,
-        "rb_finish_f_ok":     rb_finish_f_ok,
-        "rb_finish_f_found":  rb_finish_f_found,
+        "rb_approach_x":       approach_x,
+        "rb_pass_xs":          pass_xs,
+        "rb_pass_zs":          pass_zs,
+        "rb_pass_lns":         pass_lns,
+        "rb_pass_fs":          pass_fs,
+        "rb_start_ok":         rb_start_ok,
+        "rb_steps_ok":         rb_steps_ok,
+        "rb_max_step":         rb_max_step,
+        "rb_violations":       rb_violations,
+        "rb_chamfer_x_ok":     rb_chamfer_x_ok,
+        "rb_chamfer_x_found":  rb_chamfer_x_found,
+        "rb_skip_cb":          skip_cb,
+        "rb_deep_ok":          rb_deep_ok,
+        "rb_deep_violations":  rb_deep_violations,
+        "rb_rough_f_ok":       rb_rough_f_ok,
+        "rb_finish_f_ok":      rb_finish_f_ok,
+        "rb_finish_f_found":   rb_finish_f_found,
     }
 
 
@@ -1213,6 +1289,115 @@ def _find_2pc_recess(pre_flip_lines: list) -> tuple:
     # Outermost X = recess edge (largest X wins when multiple candidates exist)
     best = max(candidates, key=lambda c: c[0])
     return round(best[0], 4), round(best[1], 3)
+
+
+_STEP_DEPTH_MIN = 0.20   # shallowest plausible shelf depth
+_STEP_DEPTH_MAX = 1.85   # deepest plausible shelf depth (largest used ≈ 1.78")
+_STEP_CB_MATCH  = 0.08   # how close a feed X must be to the title CB to count as CB (in)
+_STEP_CB2_TOL   = 0.04   # counterbore X must match the 2nd title value within ~1mm
+
+
+def _find_step_bore(pre_flip_lines: list, cb_mm: float, cb2_mm: float) -> tuple:
+    """Detect a same-side counterbore STEP in the T121 pre-flip block.
+
+    A STEP cuts the center bore (CB = the larger, first title value) to a shallow
+    shelf, then steps INWARD to the counterbore (= the second title value, cb2_mm)
+    which continues deeper through the part — all from one side (OP1).  This is
+    what distinguishes a STEP from an HC part, whose second bore is the hub bore
+    cut after the flip (OP2).
+
+    The inward bore must match the *second title value* (cb2_mm).  That is the key
+    guard against false positives: an ordinary bore's breakthrough-relief pass also
+    plunges, retracts inward and goes deeper, but it retracts to an arbitrary drill
+    clearance diameter — not a named title dimension.
+
+    Signature (see O76313 OP1):
+        G01 X<cb>   Z-0.1     CB reached, shallow
+        Z-<d>                 CB stepped to shelf depth d  (the larger bore stops here)
+        X<cb2>                steps inward to the counterbore (≈ second title value)
+        Z-<deeper>            counterbore continues deeper than d
+
+    Returns (step_cb_mm, step_depth_in, cut_x_in):
+      step_cb_mm   — the title counterbore value confirmed by geometry (for display)
+      step_depth_in— the shelf depth
+      cut_x_in     — the detected counterbore cut diameter as an X value, in inches
+                     (used for CBORE scoring against title + 0.1mm)
+    or (None, None, None) when no step is found.
+    """
+    # Counterbore must exist and be smaller than the CB.
+    if not cb_mm or not cb2_mm or cb2_mm >= cb_mm:
+        return None, None, None
+    cb_x  = cb_mm / 25.4
+    cb2_x = cb2_mm / 25.4
+
+    in_t121 = False
+    in_feed = False
+    modal_x = None
+    modal_z = 0.0
+    cb_shelf_depth = None   # deepest Z the CB diameter itself is cut to (the shelf)
+
+    for ln in pre_flip_lines:
+        s = ln.strip()
+        if _T121_RE.search(s):
+            in_t121 = True; in_feed = False
+            modal_x = None; modal_z = 0.0; cb_shelf_depth = None
+            continue
+        if not in_t121:
+            continue
+        if _TOOL_CHG_RE.search(s) and not _T121_RE.search(s):
+            break
+        if _G53_RE.search(s):
+            continue
+
+        if _G00_LINE_RE.search(s):
+            in_feed = False
+        elif _FEED_RE.search(s):
+            in_feed = True
+
+        xm = _X_RE.search(s)
+        if xm:
+            xv = abs(float(xm.group(1)))
+            if xv > 0.3:
+                modal_x = xv
+        zm = _Z_RE.search(s)
+        if zm:
+            modal_z = float(zm.group(1))
+
+        if not in_feed or modal_x is None:
+            continue
+        z_abs = abs(modal_z) if modal_z < 0 else 0.0
+
+        if abs(modal_x - cb_x) <= _STEP_CB_MATCH:
+            # Cutting at the CB diameter — track how deep this shelf goes.
+            if cb_shelf_depth is None or z_abs > cb_shelf_depth:
+                cb_shelf_depth = z_abs
+        elif (cb_shelf_depth is not None
+              and abs(modal_x - cb2_x) <= _STEP_CB2_TOL
+              and z_abs > cb_shelf_depth
+              and _STEP_DEPTH_MIN <= cb_shelf_depth <= _STEP_DEPTH_MAX):
+            # Counterbore (2nd title value), inside the CB, going deeper than the
+            # CB shelf → genuine step.  modal_x is the detected counterbore cut X.
+            return round(cb2_mm, 2), round(cb_shelf_depth, 3), modal_x
+
+    return None, None, None
+
+
+_STEP_DEPTH_CMT_RE = re.compile(
+    r'\(\s*(?:step\s+)?(\d+(?:\.\d+)?)\s*"?\s*deep(?:\s+step)?\s*\)', re.IGNORECASE)
+
+
+def _step_depth_comment(lines: list) -> float | None:
+    """Return the nominal step depth called out in a comment, e.g.
+    "(0.40 deep step)" → 0.40, or None if no such comment is present.
+    The cut depth is always nominal + 0.03" (so 0.40 → z-0.43)."""
+    for ln in lines:
+        m = _STEP_DEPTH_CMT_RE.search(ln)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                pass
+    return None
 
 
 def _check_tool_homes(lines: list) -> dict:
@@ -1655,6 +1840,30 @@ def verify_file(path: str, title: str, o_number: str = None) -> dict:
     # --- Rough bore pass check (T121 pre-flip approach X and step increments) ---
     _rb = _find_rough_bore(pre_flip, specs["cb_mm"])
 
+    # --- STEP detection (G-code) — a same-side counterbore distinguishes a STEP
+    # from an HC part.  Only run on STEP *candidates*: a title with two bore values
+    # (CB/counterbore) and NO HC.  An "HC" in the title means it's a hub part, not a
+    # step, so we trust the title there and skip detection (avoids false positives).
+    _second_val = (specs.get("ob_mm") if specs.get("ob_mm") is not None
+                   else specs.get("step_mm"))
+    _title_has_hc = specs.get("hc_height_in") is not None
+    if not _title_has_hc and _second_val is not None:
+        step_cb_mm, step_depth_in, _step_cut_x_in = _find_step_bore(
+            pre_flip, specs["cb_mm"], _second_val)
+    else:
+        step_cb_mm, step_depth_in, _step_cut_x_in = None, None, None
+    step_detected = step_cb_mm is not None
+
+    # Composite rb_ok: False if any sub-check failed; True if ≥1 passed; None if all N/A
+    _rb_sub = [
+        _rb["rb_start_ok"], _rb["rb_steps_ok"], _rb["rb_deep_ok"],
+        _rb["rb_rough_f_ok"], _rb["rb_finish_f_ok"],
+    ]
+    _rb_defined = [v for v in _rb_sub if v is not None]
+    _rb_ok = (False if any(v is False for v in _rb_defined)
+              else True if _rb_defined
+              else None)
+
     # --- Find OD turn-down in BOTH OP1 (pre-flip) and OP2 (post-flip) T303 blocks ---
     _od_rs      = round(specs["round_size_in"] * 4) / 4   # nearest 0.25"
     od_expected = _OD_TABLE.get(_od_rs)
@@ -1959,6 +2168,9 @@ def verify_file(path: str, title: str, o_number: str = None) -> dict:
         "hub_is_variable":     hub_is_variable,   # True if (VARIABLE) comment on hub OD line
         "recess_x_in":         recess_x_in,       # detected recess diameter for 2PC Piece A (or None)
         "recess_z_in":         recess_z_in,       # detected recess depth for 2PC Piece A (or None)
+        "step_detected":       step_detected,     # True if a same-side counterbore step was found
+        "step_cb_mm":          step_cb_mm,        # detected counterbore diameter in mm (or None)
+        "step_depth_in":       step_depth_in,     # detected step depth in inches (or None)
         "cb_found_in":         cb_found_in,
         "cb_from_marker":      cb_from_marker,
         "cb2_found_in":        cb2_found_in,
@@ -2014,6 +2226,9 @@ def verify_file(path: str, title: str, o_number: str = None) -> dict:
         "rb_steps_ok":         _rb["rb_steps_ok"],
         "rb_max_step":         _rb["rb_max_step"],
         "rb_violations":       _rb["rb_violations"],
+        "rb_chamfer_x_ok":     _rb["rb_chamfer_x_ok"],
+        "rb_chamfer_x_found":  _rb["rb_chamfer_x_found"],
+        "rb_ok":               _rb_ok,
         "rb_skip_cb":          _rb["rb_skip_cb"],
         "rb_deep_ok":          _rb["rb_deep_ok"],
         "rb_deep_violations":  _rb["rb_deep_violations"],
@@ -2101,6 +2316,27 @@ def verify_file(path: str, title: str, o_number: str = None) -> dict:
         else:
             result["ob_diff_in"] = diff
             result["ob_ok"]      = abs(diff) <= TOLERANCE_IN
+
+    # ── STEP scoring: counterbore (CBORE) + step depth (SDOK) ───────────────
+    # CBORE: title counterbore + 0.1mm (same rule as CB) vs the detected counterbore.
+    # SDOK : depth from a "(0.40 deep step)" comment + 0.03" vs the detected depth.
+    if step_detected:
+        _title_cbore = specs.get("step_mm")
+        if _title_cbore is None:
+            _title_cbore = specs.get("ob_mm")
+        if _title_cbore is not None and _step_cut_x_in is not None:
+            _cbore_exp = _to_in(_title_cbore + 0.1)
+            result["cbore_found_in"]    = _step_cut_x_in
+            result["cbore_expected_in"] = _cbore_exp
+            result["cbore_diff_in"]     = _step_cut_x_in - _cbore_exp
+            result["cbore_ok"]          = abs(_step_cut_x_in - _cbore_exp) <= TOLERANCE_IN
+
+        _cmt_depth = _step_depth_comment(lines)
+        if _cmt_depth is not None and step_depth_in is not None:
+            result["sd_comment_in"]  = _cmt_depth
+            result["sd_expected_in"] = _cmt_depth + 0.03
+            result["sd_found_in"]    = step_depth_in
+            result["sd_score_ok"]    = abs(step_depth_in - (_cmt_depth + 0.03)) <= 0.005
 
     return result
 

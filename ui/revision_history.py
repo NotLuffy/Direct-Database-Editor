@@ -224,7 +224,7 @@ class RevisionHistoryDialog(QDialog):
 
         reply = QMessageBox.question(
             self, "Restore Revision",
-            f"Restore revision "{rev['label']}" over the current file?\n\n"
+            f"Restore revision \"{rev['label']}\" over the current file?\n\n"
             f"The current file will be backed up first.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
@@ -259,7 +259,7 @@ class RevisionHistoryDialog(QDialog):
 
             self._load_current()
             QMessageBox.information(self, "Restored",
-                f"Revision "{rev['label']}" restored successfully.")
+                f"Revision \"{rev['label']}\" restored successfully.")
         except Exception as exc:
             QMessageBox.critical(self, "Restore Failed", str(exc))
 
@@ -269,7 +269,7 @@ class RevisionHistoryDialog(QDialog):
             return
         reply = QMessageBox.question(
             self, "Delete Revision",
-            f"Remove revision "{rev['label']}" from the DB?\n"
+            f"Remove revision \"{rev['label']}\" from the DB?\n"
             f"The backup file on disk is NOT deleted.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )

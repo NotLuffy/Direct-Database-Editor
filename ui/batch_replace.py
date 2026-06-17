@@ -379,7 +379,7 @@ class BatchReplaceDialog(QDialog):
 
         reply = QMessageBox.question(
             self, "Confirm Replace",
-            f"Replace  "{find}"  →  "{replace}"\n"
+            f'Replace  "{find}"  →  "{replace}"\n'
             f"in {n_files} file(s)?\n\n"
             f"Backups will be created if a backup folder is configured in Settings.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No

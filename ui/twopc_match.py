@@ -27,6 +27,19 @@ _HUB_OFFSET = 0.003
 _CB_TOL_MM  = 0.01  # CB/OB filter tolerance in mm — exact match only
 _THICK_TOL  = 0.15
 
+# Hub-height (IH) threshold separating a short 0.25" mating hub from a tall
+# 0.50" HC hub.  A 2PC HC (= 2PC STUD HC) part carries an HC hub (IH ≈ 0.50")
+# on OP2 *and* a recess (RC) on OP1.  The HC hub's OD is detected as an HB
+# token, but that 0.50" hub is NOT a 0.25" mating hub — the HC part is a match
+# *target* on the recess (RC) side, and we look for a separate file whose 0.25"
+# hub (HB, IH < 0.40") drops into that RC.  Mirrors _part_type() in direct_models.
+_HC_IH_MIN = 0.40
+
+
+def _is_hc_hub(ih) -> bool:
+    """True when a hub height (IH) is a tall 0.50" HC hub, not a 0.25" mating hub."""
+    return ih is not None and ih >= _HC_IH_MIN
+
 _ROUND_SIZES = ["All", "5.75", "6.00", "6.25", "6.50", "7.00", "7.50",
                 "8.00", "8.50", "9.50", "10.25", "10.50", "13.00"]
 
@@ -85,6 +98,7 @@ _FG_RC      = QColor("#44ddff")
 _FG_HB      = QColor("#ffaa44")
 _FG_HB50    = QColor("#cc88ff")
 _FG_GAP     = QColor("#66ff88")
+_FG_REVIEW  = QColor("#ffcc44")   # amber — parsing-review flag
 
 # col indices
 _COL_ONUM  = 0
@@ -194,13 +208,27 @@ def _build_records(all_files: list) -> tuple[list, list]:
             "length_in":  length,
             "hc":         hc,
             "hub_height": ih,
+            "needs_review": False,
         }
         if base["rc"] is not None:
             r = dict(base)
             # Recess piece total = disc + HC height (HC hub adds to total height)
             r["total_thick"] = _total_thick(length, hc)
             pieces_a.append(r)
-        if base["hb"] is not None:
+        elif _is_hc_hub(ih):
+            # 2PC HC part (0.50" hub on OP2) but the recess on OP1 did not parse.
+            # By the part model the recess SHOULD exist — surface it on the recess
+            # side flagged for parsing review rather than dropping it silently.
+            r = dict(base)
+            r["needs_review"] = True
+            r["total_thick"]  = _total_thick(length, hc or ih)
+            pieces_a.append(r)
+        if base["hb"] is not None and not _is_hc_hub(ih):
+            # 0.25" mating-hub piece.  Exclude tall 0.50" HC hubs (IH >= 0.40"):
+            # an HC part's own hub is detected as HB, but it is NOT a 0.25" mating
+            # hub — that part participates as a recess (RC) target instead, picked
+            # up by raw_a / the hb50 source.  This keeps the HB list clean so a
+            # selected HC part only matches against true 0.25" mating hubs.
             r = dict(base)
             # Hub piece total = disc + detected hub height (IH token, typically 0.25")
             r["total_thick"] = _total_thick(length, ih)
@@ -751,10 +779,9 @@ class TwoPCMatchDialog(QDialog):
                 hc = r.get("hc")
                 if hc is not None and abs(hc - 0.50) < 0.06:
                     return True
-                # IH token >= 0.40" — true 2PC HC hub (0.47–0.50" typical)
+                # IH token >= _HC_IH_MIN — true 2PC HC hub (0.47–0.50" typical)
                 # Mirrors the threshold used in _part_type() to classify "2PC HC"
-                ih = r.get("hub_height")
-                if ih is not None and ih >= 0.40:
+                if _is_hc_hub(r.get("hub_height")):
                     return True
                 return False
             return [r for r in self._raw_a if _is_hb50(r)]
@@ -833,19 +860,24 @@ class TwoPCMatchDialog(QDialog):
             tt    = rec.get("total_thick")
             lbl   = _thick_label(tt)
             th_s  = (f"{tt:.3f}\" [{lbl}]" if lbl else f"{tt:.3f}\"") if tt is not None else "? (not in title)"
+            review = rec.get("needs_review")
+            stat_s = "⚠ PARSING REVIEW" if review else rec["status"].upper()
             cells = [
                 rec["o_number"], vs, "—",
                 f"{rec['cb_mm']:.1f}"  if rec["cb_mm"]  else "—",
                 f"{rec['ob_mm']:.1f}"  if rec["ob_mm"]  else "—",
                 th_s,
                 f"{rec['hc']:.3f}\""   if rec["hc"]     else "—",
-                rec["status"].upper(),
+                stat_s,
             ]
             for col, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 item.setData(Qt.ItemDataRole.UserRole, rec)
                 if col == _COL_VAL:
                     item.setForeground(val_fg)
+                    item.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+                elif col == _COL_STAT and review:
+                    item.setForeground(_FG_REVIEW)
                     item.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
                 else:
                     item.setForeground(_FG_NORMAL)
@@ -884,9 +916,16 @@ class TwoPCMatchDialog(QDialog):
         self._detail_sel.setPlainText(self._fmt_selected(rec, mode))
 
         if val is None:
-            token_name = "RC" if mode in ("rc", "hb50") else "HB"
-            self._detail_matches.setPlainText(
-                f"No {token_name} token — run Verify Dimensions first.")
+            if rec.get("needs_review"):
+                self._detail_matches.setPlainText(
+                    "⚠ PARSING REVIEW — title says 2PC and a 0.50\" HC hub was "
+                    "detected, but the recess (RC) on OP1 did not parse.\n"
+                    "The recess should exist on the first half; re-verify dimensions "
+                    "so this part can be matched.")
+            else:
+                token_name = "RC" if mode in ("rc", "hb50") else "HB"
+                self._detail_matches.setPlainText(
+                    f"No {token_name} token — run Verify Dimensions first.")
             dst_panel.reset_bg()
             return
 

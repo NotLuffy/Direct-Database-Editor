@@ -28,11 +28,24 @@ _MM_TO_IN = 1.0 / 25.4
 # ---------------------------------------------------------------------------
 # Tolerances for order-sheet search (wider than machining verifier tolerances)
 # ---------------------------------------------------------------------------
-_TOL_ROUND_IN  = 0.01    # round size: exact within 0.01"
-_TOL_CB_MM     = 1.5     # CB: ±1.5mm
-_TOL_OB_MM     = 2.0     # OB: ±2.0mm
-_TOL_DISC_IN   = 0.06    # disc thickness: ±0.06" (~1.5mm)
-_TOL_HC_IN     = 0.10    # HC height: ±0.10" (order sheets often round)
+_TOL_ROUND_IN     = 0.01   # round size: exact within 0.01"
+_TOL_CB_EXACT_MM  = 0.01   # CB: exact match (full score)
+_TOL_CB_NEAR_MM   = 0.10   # CB: acceptance limit — ranked after exact matches
+_TOL_CB_MM        = 1.5    # STEP counterbore / 2PC piece CB: looser (rounded notes)
+_TOL_OB_MM        = 2.0    # OB: ±2.0mm
+_TOL_DISC_IN      = 0.06   # disc thickness: ±0.06" (~1.5mm)
+_TOL_HC_IN        = 0.10   # HC height: ±0.10" (order sheets often round)
+
+
+def _disc_equivalents(v: float) -> list[float]:
+    """Shop-floor thickness substitutions (one-directional, order → program):
+    a 1/2" order can also use 15MM programs (same for the HC variants), and a
+    19MM order can use 3/4" programs and anything up to 20MM."""
+    if abs(v - 0.50) <= 0.015:
+        return [15 * _MM_TO_IN]
+    if abs(v - 19 * _MM_TO_IN) <= 0.015:
+        return [0.75, 20 * _MM_TO_IN]
+    return []
 
 # Minimum score to include a result (0–100)
 MIN_SCORE = 20
@@ -524,22 +537,29 @@ def score_title_match(params: dict, title: str) -> tuple[int, list[str]]:
     else:
         return 0, []
 
-    # ── CB (25 pts) ──────────────────────────────────────────────────────────
+    # ── CB (25 pts, hard gate) — only matching CBs are allowed: exact match
+    #    scores full, within 0.1mm ranks just below the exact matches ─────────
     t_cb = specs.get("cb_mm")
     p_cb = params["cb_mm"]
-    if t_cb is not None and abs(t_cb - p_cb) <= _TOL_CB_MM:
+    if t_cb is None or abs(t_cb - p_cb) > _TOL_CB_NEAR_MM + 1e-9:
+        return 0, []
+    if abs(t_cb - p_cb) <= _TOL_CB_EXACT_MM:
         raw += 25
         matched.append(f"CB {p_cb:.1f}mm ✓")
     else:
-        missed.append(f"CB {p_cb:.1f}mm ✗" + (f" (title: {t_cb:.1f}mm)" if t_cb else ""))
+        raw += 15
+        matched.append(f"CB {p_cb:.1f}mm ~ (title: {t_cb:.1f}mm)")
 
     # ── Disc thickness (15 pts, hard gate) ───────────────────────────────────
     # Wrong thickness is never an acceptable match; a J/M conflict accepts
-    # either of the two conflicting values (human-error leniency).
+    # either of the two conflicting values (human-error leniency), and
+    # shop-floor equivalents apply (1/2" → 15MM, 19MM → 3/4" up to 20MM).
     t_len = specs.get("length_in")
     cands = [params["disc_in"]]
     if params.get("alt_disc_in") is not None:
         cands.append(params["alt_disc_in"])
+    for c in list(cands):
+        cands.extend(_disc_equivalents(c))
     if t_len is not None and any(abs(t_len - c) <= _TOL_DISC_IN for c in cands):
         raw += 15
         matched.append(f'Disc {params["disc_in"]}" ✓')

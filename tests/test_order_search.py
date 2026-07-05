@@ -293,6 +293,29 @@ def _test_scoring():
     s, _ = osp.score_title_match(hub1, '10.25IN DIA 170.1/170 2.0 HC .5')
     _check("1.00\" hub order rejects .5 hub title", s == 0, f"score {s}")
 
+    # CB is a hard gate: exact scores full, ≤0.1mm ranks after, else rejected
+    hc = osp.parse_order_row('6.5\t6550-1/2H (Spacers)\t106.1\t106\t.50"+.50" Hub')
+    s_exact, _ = osp.score_title_match(hc, '6.5IN DIA 106.1/106 .5 HC .5')
+    s_near, _  = osp.score_title_match(hc, '6.5IN DIA 106.0/106 .5 HC .5')
+    s_far, _   = osp.score_title_match(hc, '6.5IN DIA 106.3/106 .5 HC .5')
+    _check("CB exact above 0.1mm-near above rejected",
+           s_exact > s_near >= osp.MIN_SCORE and s_far == 0,
+           f"exact {s_exact} near {s_near} far {s_far}")
+    s, _ = osp.score_title_match(hc, '6.5 77.8/106MM ID 0.5 HC')
+    _check("wrong CB rejected", s == 0, f"score {s}")
+
+    # Thickness equivalents: 1/2" (incl. HC) can use 15MM programs;
+    # 19MM can use 3/4" up to 20MM — but not 22MM
+    s, _ = osp.score_title_match(hc, '6.5IN DIA 106.1/106 15MM HC .5')
+    _check("1/2 HC order accepts 15MM HC program", s >= 90, f"score {s}")
+    p19 = osp.parse_order_row('10.25\t10225-19MM (SPACERS)\t170.1\t\t19MM')
+    s34, _ = osp.score_title_match(p19, '10.25IN DIA 170.1MM  ID .75 THK XX')
+    s20, _ = osp.score_title_match(p19, '10.25IN DIA 170.1MM  ID 20MM THK XX')
+    s22, _ = osp.score_title_match(p19, '10.25IN DIA 170.1MM  ID 22MM THK XX')
+    _check("19MM accepts 3/4 and 20MM, rejects 22MM",
+           s34 >= 90 and s20 >= 90 and s22 == 0,
+           f"3/4 {s34} 20MM {s20} 22MM {s22}")
+
     # J/M conflict: title matching the J thickness still gets disc credit
     con = osp.parse_order_row('8\t8170-8170-C\t121.3\t\t1.75"')
     s_m, f_m = osp.score_title_match(con, _T_PLAIN)   # title is 1.5 = J value

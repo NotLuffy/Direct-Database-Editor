@@ -15,7 +15,8 @@ from PyQt6.QtGui import QFont, QColor
 
 import direct_database as db
 from order_search_parser import (parse_order_row, score_title_match,
-                                  find_2pc_pairs, describe_params, MIN_SCORE)
+                                  score_modification_base, find_2pc_pairs,
+                                  describe_params, MIN_SCORE, MIN_SUGGEST_SCORE)
 
 
 # ---------------------------------------------------------------------------
@@ -91,8 +92,31 @@ class _SearchWorker(QThread):
                         best[key] = entry
 
                 results = sorted(best.values(), key=lambda x: x[0], reverse=True)
+
+                # No program matches (e.g. CR / custom request) — suggest the
+                # closest existing programs as a base to modify
+                suggestions = []
+                if not results:
+                    sim: dict[str, tuple] = {}
+                    for row in rows:
+                        if self._cancelled:
+                            return
+                        s, fields = score_modification_base(
+                            params, row["program_title"])
+                        if s < MIN_SUGGEST_SCORE:
+                            continue
+                        key = (row["o_number"] or "").upper() or str(row["id"])
+                        entry = (s, row["id"], row["o_number"] or "",
+                                 row["file_name"] or "",
+                                 row["program_title"] or "", fields)
+                        if key not in sim or s > sim[key][0]:
+                            sim[key] = entry
+                    suggestions = sorted(sim.values(),
+                                         key=lambda x: x[0], reverse=True)[:5]
+
                 out.append({"label": label, "params": params,
-                            "is_2pc": False, "results": results[:30]})
+                            "is_2pc": False, "results": results[:30],
+                            "suggestions": suggestions})
 
             self.results_ready.emit(out)
         except Exception as exc:
@@ -408,7 +432,10 @@ class OrderSearchPanel(QWidget):
                 continue
             hdr = self._add_info_item(f"{prefix}{describe_params(params)}",
                                       "#88aacc", bold=True)
+            suggestions = od.get("suggestions") or []
             order_ids = self._result_file_ids(od, results)
+            if not order_ids and suggestions:
+                order_ids = [s[1] for s in suggestions]
             all_ids.extend(order_ids)
             if order_ids:
                 # Clickable: filters the main files table to this order only
@@ -420,12 +447,18 @@ class OrderSearchPanel(QWidget):
                 self._add_info_item(f"  ⚠ {w}", "#ccaa44")
 
             if not results:
-                self._add_info_item("  no matches found", "#aa8844")
+                if suggestions:
+                    note = ("custom request — " if params.get("is_custom") else "")
+                    self._add_info_item(
+                        f"  {note}no program found — closest to modify:", "#44ccdd")
+                    self._render_suggestions(suggestions)
+                else:
+                    self._add_info_item("  no matches found", "#aa8844")
             elif od["is_2pc"]:
                 self._render_2pc_pairs(results)
             else:
                 self._render_single_results(results)
-            n_total += len(results)
+            n_total += len(results) or len(suggestions)
 
             if multi:
                 spacer = QListWidgetItem("")
@@ -450,6 +483,21 @@ class OrderSearchPanel(QWidget):
             self._results.addItem(item)
             if item._sub.text().strip():
                 self._results.addItem(item._sub)
+
+    def _render_suggestions(self, suggestions: list):
+        """Closest-program-to-modify entries: cyan, with the needed changes."""
+        for score, file_id, o_number, file_name, title, fields in suggestions:
+            item = _ResultItem(score, file_id, o_number, file_name, title, fields)
+            item.setText(f"MOD {score:3d}%  {o_number}  {file_name}")
+            item.setForeground(QColor("#44ccdd"))
+            self._results.addItem(item)
+            changes = [f for f in fields if "→" in f or "Hub:" in f]
+            sub = QListWidgetItem("     " + "   ".join(changes) if changes
+                                  else item._sub.text())
+            sub.setForeground(QColor("#337788"))
+            sub.setFont(QFont("Consolas", 9))
+            sub.setFlags(Qt.ItemFlag.NoItemFlags)
+            self._results.addItem(sub)
 
     def _render_2pc_pairs(self, pairs: list):
         for (pair_score,

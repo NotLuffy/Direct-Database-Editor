@@ -226,6 +226,9 @@ def _parse_cb(raw: str) -> dict | None:
     if not s or s == '?':
         return None
 
+    # "(CR)" = custom request — often no existing program for it
+    is_custom = bool(re.search(r'\bCR\b', s))
+
     parts = s.split("/", 1)
     cb_mm = _leading_float(parts[0])
     if cb_mm is None:
@@ -243,10 +246,10 @@ def _parse_cb(raw: str) -> dict | None:
                 depth = float(mnum.group(1))
                 if depth >= 3:          # "75 STEP" means .75" — decimal dropped
                     depth /= 100.0
-            return {"cb_mm": cb_mm, "is_step": True,
+            return {"cb_mm": cb_mm, "is_step": True, "is_custom": is_custom,
                     "step_cb_mm": second, "step_depth_in": depth}
 
-    return {"cb_mm": cb_mm, "is_step": False,
+    return {"cb_mm": cb_mm, "is_step": False, "is_custom": is_custom,
             "step_cb_mm": None, "step_depth_in": None}
 
 
@@ -436,6 +439,7 @@ def parse_order_row(text: str) -> dict | None:
         return {
             "round_in":          round_in,
             "part_type":         part_type,
+            "is_custom":         cb_data.get("is_custom", False),
             "bolt_has_hub_hint": j["has_hub"],
             "is_steel_ring":     is_steel_ring,
             "is_1pc":            j["is_1pc"],
@@ -478,6 +482,8 @@ def describe_params(p: dict) -> str:
     if p.get("hc_in") is not None:
         d += f' + {p["hc_in"]:g}" hub'
     bits.append(d)
+    if p.get("is_custom"):
+        bits.append("CR — custom request")
     return "  ·  ".join(bits)
 
 
@@ -614,6 +620,79 @@ def score_title_match(params: dict, title: str) -> tuple[int, list[str]]:
     score = round(raw * 100 / max_possible) if max_possible else 0
 
     return score, matched + missed
+
+
+# ---------------------------------------------------------------------------
+# Modification-base suggestions (no exact program exists — e.g. CR orders)
+# ---------------------------------------------------------------------------
+
+MIN_SUGGEST_SCORE = 40
+
+
+def score_modification_base(params: dict, title: str) -> tuple[int, list[str]]:
+    """
+    Similarity score for suggesting an existing program to MODIFY when no
+    program matches the order (custom requests etc.).
+
+    Unlike score_title_match, specs are not gates: only round size and the
+    structural type (steel ring / 2PC) must match — CB, thickness and hub
+    are scored by proximity and the field list shows what must be changed.
+    """
+    if not title:
+        return 0, []
+    specs = _vfy.parse_title_specs(title)
+    if specs is None:
+        return 0, []
+
+    p_type   = params.get("part_type", "STD")
+    t_is_2pc = bool(re.search(r'-*2\s*PC\b', title, re.IGNORECASE))
+    t_is_sr  = bool(specs.get("is_steel_ring")) or bool(_STEEL_RE.search(title))
+    if t_is_2pc != (p_type == "2PC") or t_is_sr != (p_type == "SR"):
+        return 0, []
+
+    t_round = specs.get("round_size_in")
+    if t_round is None or abs(t_round - params["round_in"]) > _TOL_ROUND_IN:
+        return 0, []
+
+    score  = 20
+    fields = [f'Round {params["round_in"]}" ✓']
+
+    # CB proximity (0–30): full at exact, fades out by ±10mm
+    t_cb = specs.get("cb_mm")
+    if t_cb is not None:
+        d = t_cb - params["cb_mm"]
+        score += max(0, int(round(30 - 3 * abs(d))))
+        if abs(d) <= _TOL_CB_NEAR_MM:
+            fields.append(f'CB {params["cb_mm"]:.1f}mm ✓')
+        else:
+            fields.append(f'CB: {params["cb_mm"]:g} → title {t_cb:g}mm ({-d:+.1f}mm to change)')
+
+    # Disc proximity (0–25): fades out by ±0.5"
+    t_len = specs.get("length_in")
+    if t_len is not None:
+        d = t_len - params["disc_in"]
+        score += max(0, int(round(25 - 50 * abs(d))))
+        if abs(d) <= _TOL_DISC_IN:
+            fields.append(f'Disc {params["disc_in"]:g}" ✓')
+        else:
+            fields.append(f'Disc: {params["disc_in"]:g}" → title {t_len:g}"')
+
+    # Structure: hub presence (15) + hub height proximity (10)
+    t_hc = specs.get("hc_height_in")
+    p_hc = params.get("hc_in")
+    if (t_hc is not None) == (p_hc is not None):
+        score += 15
+        if p_hc is not None:
+            d = t_hc - p_hc
+            score += max(0, int(round(10 - 20 * abs(d))))
+            if abs(d) > _TOL_HC_IN:
+                fields.append(f'Hub: {p_hc:g}" → title {t_hc:g}"')
+    elif t_hc is not None:
+        fields.append('Hub: title has a hub — remove it')
+    else:
+        fields.append('Hub: title has no hub — add one')
+
+    return min(score, 100), fields
 
 
 # ---------------------------------------------------------------------------

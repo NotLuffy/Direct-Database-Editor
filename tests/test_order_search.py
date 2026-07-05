@@ -323,6 +323,27 @@ def _test_scoring():
            f"fields {f_m}")
 
 
+def _test_suggestions():
+    print("custom request / modification suggestions:")
+    got = osp._parse_cb('56 (CR)')
+    _check("'56 (CR)' custom flag", got is not None and got["is_custom"]
+           and _close(got["cb_mm"], 56.0, 0.01), f"got {got}")
+
+    p = osp.parse_order_row('5.75\t4375-4400-F\t59.5 (CR)\t\t2.25"')
+    _check("CR row parses", p is not None and p["is_custom"], f"got {p}")
+
+    s_near, f = osp.score_modification_base(p, '5.75IN DIA 59MM ID 2.25 XX')
+    _check("suggests near-CB program", s_near >= osp.MIN_SUGGEST_SCORE
+           and any('→' in x for x in f), f"score {s_near} fields {f}")
+    s_far, _ = osp.score_modification_base(p, '5.75IN DIA 56.1MM ID 2.25 XX')
+    _check("closer CB ranks higher", s_near > s_far > 0,
+           f"near {s_near} far {s_far}")
+    s, _ = osp.score_modification_base(p, '7.5IN DIA 59MM ID 2.25 XX')
+    _check("wrong round never suggested", s == 0, f"score {s}")
+    s, _ = osp.score_modification_base(p, '5.75IN DIA 59 2PC 2.25 LUG')
+    _check("2PC never suggested for flat order", s == 0, f"score {s}")
+
+
 def _main():
     global _FAILS
     _FAILS = []
@@ -331,6 +352,7 @@ def _main():
     _test_j()
     _test_rows()
     _test_scoring()
+    _test_suggestions()
     print("RESULT:", "PASS" if not _FAILS else f"FAIL ({len(_FAILS)}: {_FAILS})")
     return 0 if not _FAILS else 1
 

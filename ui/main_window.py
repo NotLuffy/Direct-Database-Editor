@@ -218,11 +218,20 @@ class _DirectProxy(QSortFilterProxyModel):
             if not m or abs(float(m.group(1)) - sd_v) > 0.02:
                 return False
 
+        # Title specs are needed by several filters below; parse at most once per
+        # row (parse_title_specs is regex-heavy) and only when a spec filter is on.
+        _specs_cache = []   # acts as a "computed?" flag: [] = not yet, [v] = v
+
+        def _specs():
+            if not _specs_cache:
+                _specs_cache.append(_vfy.parse_title_specs(title))
+            return _specs_cache[0]
+
         # Counterbore value (mm) — STEP counterbore from title step_mm OR STEP token
         cbore_v = f.get("cbore_value")
         if cbore_v is not None:
             cands = []
-            specs = _vfy.parse_title_specs(title)
+            specs = _specs()
             if specs and specs.get("step_mm") is not None:
                 cands.append(specs["step_mm"])
             m = re.search(r'\bSTEP:(\d+(?:\.\d+)?)', rec["verify_status"] or "")
@@ -243,7 +252,7 @@ class _DirectProxy(QSortFilterProxyModel):
         if rs and rs != "All":
             try:
                 rs_val = float(rs)
-                specs = _vfy.parse_title_specs(title)
+                specs = _specs()
                 if specs is None or abs((specs.get("round_size_in") or 0) - rs_val) > 0.01:
                     return False
             except ValueError:
@@ -254,7 +263,7 @@ class _DirectProxy(QSortFilterProxyModel):
         if cb_str:
             try:
                 cb_val = float(cb_str)
-                specs = _vfy.parse_title_specs(title)
+                specs = _specs()
                 if specs is None or specs.get("cb_mm") is None:
                     return False
                 if abs(specs["cb_mm"] - cb_val) > 0.05:
@@ -267,7 +276,7 @@ class _DirectProxy(QSortFilterProxyModel):
         if ob_str:
             try:
                 ob_val = float(ob_str)
-                specs = _vfy.parse_title_specs(title)
+                specs = _specs()
                 if specs is None or specs.get("ob_mm") is None:
                     return False
                 if abs(specs["ob_mm"] - ob_val) > 0.05:
@@ -278,7 +287,7 @@ class _DirectProxy(QSortFilterProxyModel):
         # Thickness: list of labels e.g. ['1.250"', '31.8MM'] — OR logic
         th_list = f.get("thickness")
         if th_list:
-            specs = _vfy.parse_title_specs(title)
+            specs = _specs()
             th_in = (specs or {}).get("length_in")
             if th_in is None:
                 return False
@@ -294,7 +303,7 @@ class _DirectProxy(QSortFilterProxyModel):
         # Hub height
         hub_str = f.get("hub_height")
         if hub_str:
-            specs = _vfy.parse_title_specs(title)
+            specs = _specs()
             hc = (specs or {}).get("hc_height_in")
             if hub_str == "none":
                 if hc is not None:
@@ -365,6 +374,9 @@ class DirectMainWindow(QMainWindow):
         self._model          = None
         self._proxy          = _DirectProxy(self)
         self._worker         = None
+        # Last DB-side filter dict applied to the model, so we can skip a full
+        # requery + model reset when only proxy-side (spec/search) filters change.
+        self._last_db_filters: dict | None = None
         self._compare_pending: dict | None = None
 
         self.setWindowTitle("CNC Direct Editor")
@@ -1039,17 +1051,26 @@ class DirectMainWindow(QMainWindow):
     # Refresh
     # ------------------------------------------------------------------
 
-    def _refresh_all(self):
-        if not self.db_path or self._model is None:
-            return
-        current_filters = self._filter_bar.current_filters() if self._filter_bar.isVisible() else {}
+    @staticmethod
+    def _db_filters_from(current_filters: dict) -> dict:
+        """Extract the DB-side (SQL query) filters from the full filter dict.
+        Only these affect which rows the model loads; everything else is applied
+        proxy-side in filterAcceptsRow."""
         db_filters = {
             "status":       current_filters.get("status"),
             "has_dup_flag": current_filters.get("has_dup_flag"),
             "score_min":    current_filters.get("score_min"),
             "score_max":    current_filters.get("score_max"),
         }
-        self._model.refresh({k: v for k, v in db_filters.items() if v is not None})
+        return {k: v for k, v in db_filters.items() if v is not None}
+
+    def _refresh_all(self):
+        if not self.db_path or self._model is None:
+            return
+        current_filters = self._filter_bar.current_filters() if self._filter_bar.isVisible() else {}
+        db_filters = self._db_filters_from(current_filters)
+        self._model.refresh(db_filters)
+        self._last_db_filters = db_filters
         self._proxy.set_filters(current_filters)
         self._update_sidebar_counts()
         self._on_row_count_changed(self._proxy.rowCount())
@@ -1062,13 +1083,9 @@ class DirectMainWindow(QMainWindow):
         if not self.db_path or self._model is None:
             return
         current_filters = self._filter_bar.current_filters() if self._filter_bar.isVisible() else {}
-        db_filters = {
-            "status":       current_filters.get("status"),
-            "has_dup_flag": current_filters.get("has_dup_flag"),
-            "score_min":    current_filters.get("score_min"),
-            "score_max":    current_filters.get("score_max"),
-        }
-        self._model.refresh({k: v for k, v in db_filters.items() if v is not None})
+        db_filters = self._db_filters_from(current_filters)
+        self._model.refresh(db_filters)
+        self._last_db_filters = db_filters
         self._proxy.set_filters(current_filters)
         self._update_sidebar_counts()
         self._on_row_count_changed(self._proxy.rowCount())
@@ -1313,13 +1330,13 @@ class DirectMainWindow(QMainWindow):
     def _on_filters_changed(self, filters: dict):
         if self._model is None:
             return
-        db_filters = {
-            "status":       filters.get("status"),
-            "has_dup_flag": filters.get("has_dup_flag"),
-            "score_min":    filters.get("score_min"),
-            "score_max":    filters.get("score_max"),
-        }
-        self._model.refresh({k: v for k, v in db_filters.items() if v is not None})
+        # Only re-query the DB (a full model reset) when a DB-side filter actually
+        # changed.  Spec/search/reset typically only touch proxy-side filters, so
+        # we can skip the expensive requery and just re-run the proxy filter.
+        db_filters = self._db_filters_from(filters)
+        if db_filters != self._last_db_filters:
+            self._model.refresh(db_filters)
+            self._last_db_filters = db_filters
         self._proxy.set_filters(filters)
         self._on_row_count_changed(self._proxy.rowCount())
 

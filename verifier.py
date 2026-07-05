@@ -33,6 +33,7 @@ G-code structure:
 """
 
 import re
+from functools import lru_cache
 
 _MM_TO_IN      = 1.0 / 25.4
 TOLERANCE_IN   = 0.001   # ±0.001" acceptance window (CB / OB)
@@ -509,6 +510,19 @@ def _pc_table_for_round(rs: float) -> dict:
 
 
 def parse_title_specs(title: str) -> dict | None:
+    """Cached front-end for the title-spec parser.
+
+    The underlying parse is regex-heavy and is called many times for the same
+    titles (per-row in the table proxy filter, per-cell on repaint, in exports,
+    etc.), so results are memoised by title.  A shallow copy is returned so
+    callers can freely mutate the dict without corrupting the cache (all values
+    are scalars, so a shallow copy is sufficient)."""
+    cached = _parse_title_specs_cached(title)
+    return dict(cached) if cached is not None else None
+
+
+@lru_cache(maxsize=16384)
+def _parse_title_specs_cached(title: str) -> dict | None:
     """
     Return parsed spec dict or None if title has no recognisable CB/OB.
 

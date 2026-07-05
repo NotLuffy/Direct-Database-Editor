@@ -576,7 +576,8 @@ def score_title_match(params: dict, title: str) -> tuple[int, list[str]]:
         else:
             missed.append(f"OB {p_ob:.1f}mm ✗" + (f" (title: {t_ob:.1f}mm)" if t_ob else ""))
 
-    # ── HC height (5 pts, only when order specifies HC) ──────────────────────
+    # ── HC height (5 pts, hard gate when the order specifies a hub height) ───
+    # A 1.00" hub order must never surface .50"/1.25" hub files.
     has_hc_field = params["hc_in"] is not None
     max_hc = 5 if has_hc_field else 0
     if has_hc_field:
@@ -586,7 +587,7 @@ def score_title_match(params: dict, title: str) -> tuple[int, list[str]]:
             raw += 5
             matched.append(f'HC {p_hc:.3f}" ✓')
         else:
-            missed.append(f'HC {p_hc:.3f}" ✗' + (f' (title: {t_hc:.3f}")' if t_hc else ""))
+            return 0, []
 
     # ── Normalize to 0–100 ───────────────────────────────────────────────────
     max_possible = 30 + 25 + 15 + 15 + max_step + max_ob + max_hc

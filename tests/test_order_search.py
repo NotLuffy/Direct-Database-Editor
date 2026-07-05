@@ -285,6 +285,14 @@ def _test_scoring():
     s, _ = osp.score_title_match(hc10, '8.5IN 124.1/124.1MM ID 1.5--HC')
     _check("10MM HC order rejects 1.5\" title", s == 0, f"score {s}")
 
+    # Hub height is a hard gate: 1.00" hub order rejects .50" hub files
+    hub1 = osp.parse_order_row(
+        '10.25\t10225-10225-EH-1.00"\t170.1\t170 (6.58HLB)\t2.00"+1.00"HUB')
+    s, _ = osp.score_title_match(hub1, '10.25IN DIA 170.1/170 2.0 HC 1.0')
+    _check("1.00\" hub order vs 1.0 hub title", s >= 90, f"score {s}")
+    s, _ = osp.score_title_match(hub1, '10.25IN DIA 170.1/170 2.0 HC .5')
+    _check("1.00\" hub order rejects .5 hub title", s == 0, f"score {s}")
+
     # J/M conflict: title matching the J thickness still gets disc credit
     con = osp.parse_order_row('8\t8170-8170-C\t121.3\t\t1.75"')
     s_m, f_m = osp.score_title_match(con, _T_PLAIN)   # title is 1.5 = J value

@@ -533,7 +533,9 @@ def score_title_match(params: dict, title: str) -> tuple[int, list[str]]:
     else:
         missed.append(f"CB {p_cb:.1f}mm ✗" + (f" (title: {t_cb:.1f}mm)" if t_cb else ""))
 
-    # ── Disc thickness (15 pts) — J/M conflict accepts either value ─────────
+    # ── Disc thickness (15 pts, hard gate) ───────────────────────────────────
+    # Wrong thickness is never an acceptable match; a J/M conflict accepts
+    # either of the two conflicting values (human-error leniency).
     t_len = specs.get("length_in")
     cands = [params["disc_in"]]
     if params.get("alt_disc_in") is not None:
@@ -542,8 +544,7 @@ def score_title_match(params: dict, title: str) -> tuple[int, list[str]]:
         raw += 15
         matched.append(f'Disc {params["disc_in"]}" ✓')
     else:
-        missed.append(f'Disc {params["disc_in"]}" ✗'
-                      + (f' (title: {t_len:.3f}")' if t_len else ""))
+        return 0, []
 
     # ── Part type (15 pts — gates above guarantee the match) ─────────────────
     raw += 15

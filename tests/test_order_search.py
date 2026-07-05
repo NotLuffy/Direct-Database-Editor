@@ -278,6 +278,13 @@ def _test_scoring():
     s, _ = osp.score_title_match(flat9, _T_STEP)
     _check("flat order rejects STEP title", s == 0, f"score {s}")
 
+    # Thickness is a hard gate: same CB/OB/type but wrong disc must be rejected
+    hc10 = osp.parse_order_row('8.5\t8180-10H (SPACERS)\t124.1\t124.1\t10MM+.50"HUB)')
+    s, _ = osp.score_title_match(hc10, '8.5IN DIA 124.1/124MM 10MM HC')
+    _check("10MM HC order vs 10MM title", s >= 80, f"score {s}")
+    s, _ = osp.score_title_match(hc10, '8.5IN 124.1/124.1MM ID 1.5--HC')
+    _check("10MM HC order rejects 1.5\" title", s == 0, f"score {s}")
+
     # J/M conflict: title matching the J thickness still gets disc credit
     con = osp.parse_order_row('8\t8170-8170-C\t121.3\t\t1.75"')
     s_m, f_m = osp.score_title_match(con, _T_PLAIN)   # title is 1.5 = J value

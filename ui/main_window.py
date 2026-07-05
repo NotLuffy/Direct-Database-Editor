@@ -148,22 +148,40 @@ class _DirectProxy(QSortFilterProxyModel):
         super().__init__(parent)
         self._filters: dict = {}
         # Order-search results mode: when set, the table shows exactly these
-        # file ids (its own results list) and every other filter is bypassed.
-        self._result_ids: set[int] | None = None
+        # file ids (its own results list, best match first) and every other
+        # filter is bypassed.  Maps file_id -> match rank (0 = best).
+        self._result_rank: dict[int, int] | None = None
 
     def set_filters(self, filters: dict):
         self._filters = filters or {}
         self.invalidateFilter()
 
     def set_result_filter(self, file_ids: list | None):
-        """Restrict the table to the given file ids (order-search results).
-        Pass None (or an empty list) to return to normal filtering."""
-        self._result_ids = set(file_ids) if file_ids else None
-        self.invalidateFilter()
+        """Restrict the table to the given file ids (order-search results,
+        ordered best match first).  Pass None/[] to return to normal filtering."""
+        if file_ids:
+            self._result_rank = {fid: i for i, fid in enumerate(file_ids)}
+            self.invalidateFilter()
+            # Sort by match rank (lessThan below) so the best match is on top
+            self.sort(0, Qt.SortOrder.AscendingOrder)
+        else:
+            self._result_rank = None
+            self.sort(-1)                  # back to natural (source) row order
+            self.invalidateFilter()
 
     @property
     def result_filter_active(self) -> bool:
-        return self._result_ids is not None
+        return self._result_rank is not None
+
+    def lessThan(self, left, right):
+        # In results mode the table is ordered by match rank, best first
+        if self._result_rank is not None:
+            model = self.sourceModel()
+            big = 1 << 30
+            lr = self._result_rank.get(model.get_file_id(left.row()),  big)
+            rr = self._result_rank.get(model.get_file_id(right.row()), big)
+            return lr < rr
+        return super().lessThan(left, right)
 
     def filterAcceptsRow(self, source_row: int, source_parent):
         model = self.sourceModel()
@@ -172,8 +190,8 @@ class _DirectProxy(QSortFilterProxyModel):
             return True
 
         # Order-search results mode overrides all other filters
-        if self._result_ids is not None:
-            return model.get_file_id(source_row) in self._result_ids
+        if self._result_rank is not None:
+            return model.get_file_id(source_row) in self._result_rank
 
         f = self._filters
         title = rec["program_title"] or ""

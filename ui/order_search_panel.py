@@ -33,10 +33,12 @@ class _SearchWorker(QThread):
     results_ready = pyqtSignal(list)
     error         = pyqtSignal(str)
 
-    def __init__(self, db_path: str, orders: list, parent=None):
+    def __init__(self, db_path: str, orders: list, scope_folders: list | None = None,
+                 parent=None):
         super().__init__(parent)
         self._db_path   = db_path
         self._orders    = orders      # list of (label, params-or-None)
+        self._scope     = scope_folders
         self._cancelled = False
 
     def cancel(self):
@@ -45,12 +47,17 @@ class _SearchWorker(QThread):
     def run(self):
         try:
             conn = db.get_connection(self._db_path)
-            rows = conn.execute(
-                "SELECT id, o_number, file_name, program_title "
-                "FROM files "
-                "WHERE program_title IS NOT NULL AND program_title != '' "
-                "ORDER BY o_number"
-            ).fetchall()
+            # Scope to the open workspace folders — same as the main table —
+            # so results are files the user can actually see and open.
+            sql = ("SELECT id, o_number, file_name, program_title "
+                   "FROM files "
+                   "WHERE program_title IS NOT NULL AND program_title != '' ")
+            args = []
+            if self._scope:
+                sql += ("AND source_folder IN ("
+                        + ",".join("?" * len(self._scope)) + ") ")
+                args = list(self._scope)
+            rows = conn.execute(sql + "ORDER BY o_number", args).fetchall()
             conn.close()
 
             out = []
@@ -63,7 +70,8 @@ class _SearchWorker(QThread):
                     continue
 
                 if params.get("is_2pc"):
-                    pairs = find_2pc_pairs(params, self._db_path)
+                    pairs = find_2pc_pairs(params, self._db_path,
+                                           scope_folders=self._scope)
                     out.append({"label": label, "params": params,
                                 "is_2pc": True, "results": pairs})
                     continue
@@ -148,11 +156,16 @@ class _ResultItem(QListWidgetItem):
 
 class OrderSearchPanel(QWidget):
 
-    go_to_file = pyqtSignal(int)   # file_id
+    go_to_file   = pyqtSignal(int)    # file_id
+    # Show these file ids in the main files table (ordered; [] = back to normal).
+    # Emitted automatically with all results after a search, or with a single
+    # order's results when its header line is clicked.
+    filter_table = pyqtSignal(list)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._db_path = ""
+        self._scope_folders: list | None = None
         self._worker: _SearchWorker | None = None
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -256,6 +269,7 @@ class OrderSearchPanel(QWidget):
         self._results.setSelectionMode(
             QAbstractItemView.SelectionMode.SingleSelection)
         self._results.itemDoubleClicked.connect(self._on_item_double_clicked)
+        self._results.itemClicked.connect(self._on_item_clicked)
         root.addWidget(self._results, stretch=1)
 
         # ── Parse hint ──
@@ -268,8 +282,10 @@ class OrderSearchPanel(QWidget):
     # Public API
     # ------------------------------------------------------------------
 
-    def set_db_path(self, db_path: str):
+    def set_db_path(self, db_path: str, scope_folders: list | None = None):
         self._db_path = db_path
+        if scope_folders is not None:
+            self._scope_folders = list(scope_folders)
 
     # ------------------------------------------------------------------
     # Slots
@@ -284,10 +300,17 @@ class OrderSearchPanel(QWidget):
         self._results.clear()
         self._status_lbl.setText("")
         self._hint_lbl.setText("")
+        self.filter_table.emit([])     # main table back to normal filtering
 
     def _on_item_double_clicked(self, item: QListWidgetItem):
         if isinstance(item, _ResultItem):
             self.go_to_file.emit(item.file_id)
+
+    def _on_item_clicked(self, item: QListWidgetItem):
+        # Clicking an order header filters the main table to that order's files
+        ids = getattr(item, "order_file_ids", None)
+        if ids:
+            self.filter_table.emit(ids)
 
     def _run_search(self):
         self._debounce.stop()
@@ -332,7 +355,8 @@ class OrderSearchPanel(QWidget):
             self._worker.results_ready.disconnect()
             self._worker.error.disconnect()
 
-        self._worker = _SearchWorker(self._db_path, orders, self)
+        self._worker = _SearchWorker(self._db_path, orders,
+                                     self._scope_folders, self)
         self._worker.results_ready.connect(self._on_results)
         self._worker.error.connect(self._on_error)
         self._worker.start()
@@ -350,6 +374,17 @@ class OrderSearchPanel(QWidget):
         self._results.addItem(item)
         return item
 
+    @staticmethod
+    def _result_file_ids(od: dict, results: list) -> list[int]:
+        """Ordered file ids for one order's results (ring+hat for 2PC pairs)."""
+        ids = []
+        if od["is_2pc"]:
+            for p in results:
+                ids.extend((p[1], p[5]))
+        else:
+            ids.extend(r[1] for r in results)
+        return list(dict.fromkeys(ids))      # dedup, keep rank order
+
     def _on_results(self, order_results: list):
         self._search_btn.setEnabled(True)
         self._results.clear()
@@ -358,6 +393,7 @@ class OrderSearchPanel(QWidget):
         per_limit = 8 if multi else 30
         n_total   = 0
         n_bad     = 0
+        all_ids   = []
 
         for idx, od in enumerate(order_results, 1):
             params  = od["params"]
@@ -370,8 +406,16 @@ class OrderSearchPanel(QWidget):
                 self._add_info_item(f"✗ {prefix}could not parse: {od['label'][:60]}",
                                     "#ff6655", bold=True)
                 continue
-            self._add_info_item(f"{prefix}{describe_params(params)}",
-                                "#88aacc", bold=True)
+            hdr = self._add_info_item(f"{prefix}{describe_params(params)}",
+                                      "#88aacc", bold=True)
+            order_ids = self._result_file_ids(od, results)
+            all_ids.extend(order_ids)
+            if order_ids:
+                # Clickable: filters the main files table to this order only
+                hdr.order_file_ids = order_ids
+                hdr.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                hdr.setToolTip("Click to show only this order's matches "
+                               "in the files table")
             for w in params.get("warnings", []):
                 self._add_info_item(f"  ⚠ {w}", "#ccaa44")
 
@@ -395,6 +439,10 @@ class OrderSearchPanel(QWidget):
                  f"{n_total} result(s)" if n_total else "no matches",
                  f"{n_bad} line(s) unreadable" if n_bad else None]
         self._status_lbl.setText(" — ".join(p for p in parts if p))
+
+        # Push all results into the main files table (its own results view —
+        # rows there have full verify status, right-click menu, etc.)
+        self.filter_table.emit(list(dict.fromkeys(all_ids)))
 
     def _render_single_results(self, results: list):
         for score, file_id, o_number, file_name, title, fields in results:

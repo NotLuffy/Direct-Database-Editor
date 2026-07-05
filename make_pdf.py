@@ -309,6 +309,11 @@ story += [
       "(HC) files, and flat orders never show 2PC or HC files."),
     b("Results are scored 0–100%.  <b>Green ≥ 80%</b> is an exact match."),
     b("Each result shows which fields matched (Round ✓  CB ✓  Disc ✓)."),
+    b("The matching files also fill the <b>main files table</b> as their own "
+      "results list — there you can see the full verify status, right-click "
+      "for the usual actions, and open files. With several orders pasted, "
+      "click an order's blue header line to show only that order's files. "
+      "Change any filter or click Clear to return to the normal file list."),
     b("For <b>2-piece</b> orders the app finds matching pairs — "
       "a ring file and a hub/bell file — and shows them grouped together."),
     b("Double-click any result to jump straight to that file in the "

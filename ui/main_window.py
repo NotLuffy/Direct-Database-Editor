@@ -147,16 +147,33 @@ class _DirectProxy(QSortFilterProxyModel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._filters: dict = {}
+        # Order-search results mode: when set, the table shows exactly these
+        # file ids (its own results list) and every other filter is bypassed.
+        self._result_ids: set[int] | None = None
 
     def set_filters(self, filters: dict):
         self._filters = filters or {}
         self.invalidateFilter()
+
+    def set_result_filter(self, file_ids: list | None):
+        """Restrict the table to the given file ids (order-search results).
+        Pass None (or an empty list) to return to normal filtering."""
+        self._result_ids = set(file_ids) if file_ids else None
+        self.invalidateFilter()
+
+    @property
+    def result_filter_active(self) -> bool:
+        return self._result_ids is not None
 
     def filterAcceptsRow(self, source_row: int, source_parent):
         model = self.sourceModel()
         rec = model.get_row_data(source_row)
         if rec is None:
             return True
+
+        # Order-search results mode overrides all other filters
+        if self._result_ids is not None:
+            return model.get_file_id(source_row) in self._result_ids
 
         f = self._filters
         title = rec["program_title"] or ""
@@ -525,6 +542,7 @@ class DirectMainWindow(QMainWindow):
         self._order_search_panel = OrderSearchPanel()
         self._order_search_panel.setVisible(False)
         self._order_search_panel.go_to_file.connect(self._on_order_search_go_to_file)
+        self._order_search_panel.filter_table.connect(self._on_order_results_filter)
         splitter.addWidget(self._order_search_panel)
 
         # Right pane: header + table
@@ -897,7 +915,8 @@ class DirectMainWindow(QMainWindow):
         self._editor_panel.db_path = self.db_path
         self._dup_panel.db_path    = self.db_path
         self._verify_panel.clear()
-        self._order_search_panel.set_db_path(self.db_path)
+        self._order_search_panel.set_db_path(self.db_path,
+                                             scope_folders=list(self.scan_folders))
         self._bug_list_panel.set_db_path(self.db_path)
 
         if self._model is None:
@@ -1069,6 +1088,8 @@ class DirectMainWindow(QMainWindow):
             return
         current_filters = self._filter_bar.current_filters() if self._filter_bar.isVisible() else {}
         db_filters = self._db_filters_from(current_filters)
+        if self._proxy.result_filter_active:
+            db_filters = {}   # keep every order-search result row loaded
         self._model.refresh(db_filters)
         self._last_db_filters = db_filters
         self._proxy.set_filters(current_filters)
@@ -1084,6 +1105,8 @@ class DirectMainWindow(QMainWindow):
             return
         current_filters = self._filter_bar.current_filters() if self._filter_bar.isVisible() else {}
         db_filters = self._db_filters_from(current_filters)
+        if self._proxy.result_filter_active:
+            db_filters = {}   # keep every order-search result row loaded
         self._model.refresh(db_filters)
         self._last_db_filters = db_filters
         self._proxy.set_filters(current_filters)
@@ -1173,14 +1196,21 @@ class DirectMainWindow(QMainWindow):
         self._bottom_tabs.setCurrentWidget(self._verify_panel)
 
     def _on_row_count_changed(self, n: int):
-        self._table_header.setText(f"  Files  ({n:,})")
-        self._status_bar.showMessage(
-            f"{n:,} files shown  |  DB: {self.db_path}")
+        if self._proxy.result_filter_active:
+            self._table_header.setText(f"  Order Search Results  ({n:,})")
+            self._status_bar.showMessage(
+                f"{n:,} order-search result(s) shown — change a filter or clear "
+                f"the order search to return to all files  |  DB: {self.db_path}")
+        else:
+            self._table_header.setText(f"  Files  ({n:,})")
+            self._status_bar.showMessage(
+                f"{n:,} files shown  |  DB: {self.db_path}")
         # Show empty-state message when no rows visible
         if n == 0 and self.db_path:
-            filters_active = bool(self._filter_bar.isVisible() and
-                                  self._filter_bar.current_filters())
-            if filters_active:
+            if self._proxy.result_filter_active:
+                msg = "No order-search results to show\nClear the order search to see all files"
+            elif bool(self._filter_bar.isVisible() and
+                      self._filter_bar.current_filters()):
                 msg = "No files match the current filters\nClick Filters to adjust or clear them"
             else:
                 msg = "No files found\nAdd a folder and click Rescan to import your programs"
@@ -1292,21 +1322,42 @@ class DirectMainWindow(QMainWindow):
             panel_w   = 290
             right_w   = max(400, total - sidebar_w - panel_w)
             self._main_splitter.setSizes([sidebar_w, panel_w, right_w])
-            self._order_search_panel.set_db_path(self.db_path)
+            self._order_search_panel.set_db_path(self.db_path,
+                                             scope_folders=list(self.scan_folders))
         else:
             total = sum(sizes)
             self._main_splitter.setSizes([sizes[0], 0, total - sizes[0]])
+            # Leaving order search returns the table to normal filtering
+            self._on_order_results_filter([])
+
+    def _on_order_results_filter(self, file_ids: list):
+        """Show order-search results in the main files table ([] = back to normal)."""
+        if self._model is None:
+            return
+        if file_ids:
+            # Make sure every result row is loaded regardless of DB-side filters
+            if self._last_db_filters:
+                self._model.refresh({})
+                self._last_db_filters = {}
+            self._proxy.set_result_filter(file_ids)
+        else:
+            if not self._proxy.result_filter_active:
+                return
+            self._proxy.set_result_filter(None)
+        self._on_row_count_changed(self._proxy.rowCount())
 
     def _on_order_search_go_to_file(self, file_id: int):
         """Navigate the main table to the given file_id, clearing filters first."""
         if self._model is None:
             return
 
-        # Clear filters so the target row is definitely visible
-        self._filters_btn.setChecked(False)
-        self._filter_bar.reset()
-        self._model.refresh({})
-        self._proxy.set_filters({})
+        # In results view the row is already visible — keep the view intact.
+        # Otherwise clear filters so the target row is definitely visible.
+        if not self._proxy.result_filter_active:
+            self._filters_btn.setChecked(False)
+            self._filter_bar.reset()
+            self._model.refresh({})
+            self._proxy.set_filters({})
 
         # Linear scan to find the source row
         source_row = None
@@ -1330,6 +1381,9 @@ class DirectMainWindow(QMainWindow):
     def _on_filters_changed(self, filters: dict):
         if self._model is None:
             return
+        # Touching the filter bar exits order-search results mode
+        if self._proxy.result_filter_active:
+            self._proxy.set_result_filter(None)
         # Only re-query the DB (a full model reset) when a DB-side filter actually
         # changed.  Spec/search/reset typically only touch proxy-side filters, so
         # we can skip the expensive requery and just re-run the proxy filter.

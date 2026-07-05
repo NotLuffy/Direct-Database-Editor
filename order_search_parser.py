@@ -666,7 +666,8 @@ def _score_2pc_piece(round_in: float, cb_mm: float, thickness_in: float | None,
     return min(raw, 100), matched + missed
 
 
-def find_2pc_pairs(params: dict, db_path: str) -> list[tuple]:
+def find_2pc_pairs(params: dict, db_path: str,
+                   scope_folders: list | None = None) -> list[tuple]:
     """
     For a 2PC order row, find pairs of files (ring + bell/hat) that fit together.
 
@@ -711,13 +712,16 @@ def find_2pc_pairs(params: dict, db_path: str) -> list[tuple]:
         forbid_hc_a  = False
 
     conn = db_mod.get_connection(db_path)
-    rows = conn.execute(
-        "SELECT id, o_number, file_name, program_title, verify_status "
-        "FROM files "
-        "WHERE program_title IS NOT NULL AND program_title != '' "
-        "  AND (program_title LIKE '%2PC%' OR program_title LIKE '%2 PC%') "
-        "ORDER BY o_number"
-    ).fetchall()
+    sql = ("SELECT id, o_number, file_name, program_title, verify_status "
+           "FROM files "
+           "WHERE program_title IS NOT NULL AND program_title != '' "
+           "  AND (program_title LIKE '%2PC%' OR program_title LIKE '%2 PC%') ")
+    args: list = []
+    if scope_folders:
+        sql += ("AND source_folder IN ("
+                + ",".join("?" * len(scope_folders)) + ") ")
+        args = list(scope_folders)
+    rows = conn.execute(sql + "ORDER BY o_number", args).fetchall()
     conn.close()
 
     # Deduplicate by o_number, keep first occurrence

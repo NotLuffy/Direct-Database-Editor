@@ -287,19 +287,26 @@ story += [
     h1("6 — Order Sheet Search"),
     p("Click <b>Order Search</b> in the toolbar to open the search panel. "
       "Copy cells I through M from your order sheet and paste them directly "
-      "into the paste box. The app will find matching programs in your library."),
+      "into the paste box — several rows at once are fine, one order per "
+      "line. The app will find the closest matching programs for each order."),
     sp(4),
     h2("What Each Column Means"),
     table([
         ["Column", "Contains",      "Example"],
         ["I",      "Round size",    "7   or   9.5"],
-        ["J",      "Bolt pattern",  "5550-5450-A   (H suffix = hub,  SR = steel ring,  2PC = two-piece)"],
+        ["J",      "Bolt pattern",  "5550-5450-A   (letter A=1.00\" +0.25\"/letter,  trailing H = hub,  SR = steel ring,  2PC = two-piece,  1pc = not two-piece)"],
         ["K",      "CB in mm",      "87.1   or   110/74 (.40 DEEP STEP)  for step parts"],
-        ["L",      "OB / hub bore", "142   (leave blank if no hub)"],
+        ["L",      "OB / hub bore", "142   (leave blank if no hub — a value here means an HC part)"],
         ["M",      "Thickness",     '1.00"  or  1.75"+.50"HUB  or  1.25" (20mm+20mm)'],
     ], [0.45*inch, 1.15*inch, 5.1*inch]),
     sp(8),
     h2("Reading the Results"),
+    b("Above each order's results the app shows how it read the order "
+      "(part type, round, CB, thickness). Check this line first — a yellow "
+      "⚠ warning means something in the row looked mistyped or inconsistent."),
+    b("The part type is a strict filter: SR orders only show steel-ring "
+      "files, 2PC only two-piece files, orders with an OB value only hub "
+      "(HC) files, and flat orders never show 2PC or HC files."),
     b("Results are scored 0–100%.  <b>Green ≥ 80%</b> is an exact match."),
     b("Each result shows which fields matched (Round ✓  CB ✓  Disc ✓)."),
     b("For <b>2-piece</b> orders the app finds matching pairs — "

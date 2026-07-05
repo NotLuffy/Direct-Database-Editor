@@ -16,6 +16,7 @@ _MODULES = [
     "test_title_parser",
     "test_tz_depth",
     "test_verifier_checks",
+    "test_order_search",
 ]
 
 

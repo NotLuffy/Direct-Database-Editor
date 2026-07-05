@@ -1,8 +1,8 @@
 """
 CNC Direct Editor — Order Sheet Search panel.
 
-Paste a tab-separated row from the order sheet (columns I-M) and
-find matching CNC program files by parsed specs.
+Paste one or more tab-separated rows from the order sheet (columns I-M) and
+find the closest matching CNC program files per order.
 """
 
 from PyQt6.QtWidgets import (
@@ -15,7 +15,7 @@ from PyQt6.QtGui import QFont, QColor
 
 import direct_database as db
 from order_search_parser import (parse_order_row, score_title_match,
-                                  find_2pc_pairs, MIN_SCORE)
+                                  find_2pc_pairs, describe_params, MIN_SCORE)
 
 
 # ---------------------------------------------------------------------------
@@ -23,17 +23,20 @@ from order_search_parser import (parse_order_row, score_title_match,
 # ---------------------------------------------------------------------------
 
 class _SearchWorker(QThread):
-    # is_2pc=False: list of (score, id, o_number, file_name, title, fields)
-    # is_2pc=True:  list of (pair_score, ring_id, ring_o, ring_name, ring_title,
+    # Emits a list of per-order dicts:
+    #   {"label": pasted line, "params": dict | None, "is_2pc": bool,
+    #    "results": [...]}
+    # is_2pc=False results: (score, id, o_number, file_name, title, fields)
+    # is_2pc=True  results: (pair_score, ring_id, ring_o, ring_name, ring_title,
     #                                    hat_id,  hat_o,  hat_name,  hat_title,
     #                                    ring_fields, hat_fields)
-    results_ready = pyqtSignal(list, bool)
+    results_ready = pyqtSignal(list)
     error         = pyqtSignal(str)
 
-    def __init__(self, db_path: str, params: dict, parent=None):
+    def __init__(self, db_path: str, orders: list, parent=None):
         super().__init__(parent)
         self._db_path   = db_path
-        self._params    = params
+        self._orders    = orders      # list of (label, params-or-None)
         self._cancelled = False
 
     def cancel(self):
@@ -41,11 +44,6 @@ class _SearchWorker(QThread):
 
     def run(self):
         try:
-            if self._params.get("is_2pc"):
-                pairs = find_2pc_pairs(self._params, self._db_path)
-                self.results_ready.emit(pairs, True)
-                return
-
             conn = db.get_connection(self._db_path)
             rows = conn.execute(
                 "SELECT id, o_number, file_name, program_title "
@@ -55,22 +53,40 @@ class _SearchWorker(QThread):
             ).fetchall()
             conn.close()
 
-            # Score all rows, deduplicate by o_number keeping best score
-            best: dict[str, tuple] = {}
-            for row in rows:
+            out = []
+            for label, params in self._orders:
                 if self._cancelled:
                     return
-                score, fields = score_title_match(self._params, row["program_title"])
-                if score < MIN_SCORE:
+                if params is None:
+                    out.append({"label": label, "params": None,
+                                "is_2pc": False, "results": []})
                     continue
-                key = (row["o_number"] or "").upper() or str(row["id"])
-                entry = (score, row["id"], row["o_number"] or "",
-                         row["file_name"] or "", row["program_title"] or "", fields)
-                if key not in best or score > best[key][0]:
-                    best[key] = entry
 
-            results = sorted(best.values(), key=lambda x: x[0], reverse=True)
-            self.results_ready.emit(results[:30], False)
+                if params.get("is_2pc"):
+                    pairs = find_2pc_pairs(params, self._db_path)
+                    out.append({"label": label, "params": params,
+                                "is_2pc": True, "results": pairs})
+                    continue
+
+                # Score all rows, deduplicate by o_number keeping best score
+                best: dict[str, tuple] = {}
+                for row in rows:
+                    if self._cancelled:
+                        return
+                    score, fields = score_title_match(params, row["program_title"])
+                    if score < MIN_SCORE:
+                        continue
+                    key = (row["o_number"] or "").upper() or str(row["id"])
+                    entry = (score, row["id"], row["o_number"] or "",
+                             row["file_name"] or "", row["program_title"] or "", fields)
+                    if key not in best or score > best[key][0]:
+                        best[key] = entry
+
+                results = sorted(best.values(), key=lambda x: x[0], reverse=True)
+                out.append({"label": label, "params": params,
+                            "is_2pc": False, "results": results[:30]})
+
+            self.results_ready.emit(out)
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -202,7 +218,7 @@ class OrderSearchPanel(QWidget):
         self._paste_box.setPlaceholderText(
             "Round  BoltPattern  CB_mm  OB_mm  Thickness\n"
             "e.g. 9.5  8170-8200-DH  125  142  1.75\"+.50\"HUB\n"
-            "or   7    5550-5450-A   87.1       1.00\""
+            "Multiple rows OK — one order per line."
         )
         self._paste_box.textChanged.connect(self._on_text_changed)
         root.addWidget(self._paste_box)
@@ -287,10 +303,20 @@ class OrderSearchPanel(QWidget):
             self._status_lbl.setText("No workspace open.")
             return
 
-        params = parse_order_row(text)
-        if params is None:
+        orders = []
+        n_ok = 0
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            params = parse_order_row(line)
+            orders.append((line, params))
+            if params is not None:
+                n_ok += 1
+
+        if n_ok == 0:
             self._hint_lbl.setText(
-                "Could not parse row. Expected 5 tab-separated values:\n"
+                "Could not parse any row. Expected 5 tab-separated values per line:\n"
                 "Round  BoltPattern  CB_mm  OB_mm  Thickness")
             self._status_lbl.setText("")
             return
@@ -306,36 +332,71 @@ class OrderSearchPanel(QWidget):
             self._worker.results_ready.disconnect()
             self._worker.error.disconnect()
 
-        self._worker = _SearchWorker(self._db_path, params, self)
+        self._worker = _SearchWorker(self._db_path, orders, self)
         self._worker.results_ready.connect(self._on_results)
         self._worker.error.connect(self._on_error)
         self._worker.start()
 
-    def _on_results(self, results: list, is_2pc: bool):
+    # ------------------------------------------------------------------
+    # Rendering
+    # ------------------------------------------------------------------
+
+    def _add_info_item(self, text: str, color: str, size: int = 9, bold: bool = False):
+        item = QListWidgetItem(text)
+        item.setForeground(QColor(color))
+        weight = QFont.Weight.Bold if bold else QFont.Weight.Normal
+        item.setFont(QFont("Consolas", size, weight))
+        item.setFlags(Qt.ItemFlag.NoItemFlags)
+        self._results.addItem(item)
+        return item
+
+    def _on_results(self, order_results: list):
         self._search_btn.setEnabled(True)
         self._results.clear()
 
-        if not results:
-            self._status_lbl.setStyleSheet("color:#aa8844; font-size:10px;")
-            self._status_lbl.setText("No matches found.")
-            return
+        multi     = len(order_results) > 1
+        per_limit = 8 if multi else 30
+        n_total   = 0
+        n_bad     = 0
 
-        if is_2pc:
-            self._render_2pc_pairs(results)
-        else:
-            self._render_single_results(results)
+        for idx, od in enumerate(order_results, 1):
+            params  = od["params"]
+            results = od["results"][:per_limit]
+
+            # ── Order header: parsed interpretation ─────────────────────
+            prefix = f"ORDER {idx} · " if multi else ""
+            if params is None:
+                n_bad += 1
+                self._add_info_item(f"✗ {prefix}could not parse: {od['label'][:60]}",
+                                    "#ff6655", bold=True)
+                continue
+            self._add_info_item(f"{prefix}{describe_params(params)}",
+                                "#88aacc", bold=True)
+            for w in params.get("warnings", []):
+                self._add_info_item(f"  ⚠ {w}", "#ccaa44")
+
+            if not results:
+                self._add_info_item("  no matches found", "#aa8844")
+            elif od["is_2pc"]:
+                self._render_2pc_pairs(results)
+            else:
+                self._render_single_results(results)
+            n_total += len(results)
+
+            if multi:
+                spacer = QListWidgetItem("")
+                spacer.setFlags(Qt.ItemFlag.NoItemFlags)
+                self._results.addItem(spacer)
+
+        ok_orders = len(order_results) - n_bad
+        self._status_lbl.setStyleSheet(
+            ("color:#44aa66;" if n_total else "color:#aa8844;") + " font-size:10px;")
+        parts = [f"{ok_orders} order(s)" if multi else None,
+                 f"{n_total} result(s)" if n_total else "no matches",
+                 f"{n_bad} line(s) unreadable" if n_bad else None]
+        self._status_lbl.setText(" — ".join(p for p in parts if p))
 
     def _render_single_results(self, results: list):
-        exact   = sum(1 for r in results if r[0] >= 80)
-        close   = sum(1 for r in results if 60 <= r[0] < 80)
-        partial = sum(1 for r in results if r[0] < 60)
-        parts = []
-        if exact:   parts.append(f"{exact} exact")
-        if close:   parts.append(f"{close} close")
-        if partial: parts.append(f"{partial} partial")
-        self._status_lbl.setStyleSheet("color:#44aa66; font-size:10px;")
-        self._status_lbl.setText(f"{len(results)} results — " + ", ".join(parts))
-
         for score, file_id, o_number, file_name, title, fields in results:
             item = _ResultItem(score, file_id, o_number, file_name, title, fields)
             self._results.addItem(item)
@@ -343,9 +404,6 @@ class OrderSearchPanel(QWidget):
                 self._results.addItem(item._sub)
 
     def _render_2pc_pairs(self, pairs: list):
-        self._status_lbl.setStyleSheet("color:#44ccdd; font-size:10px;")
-        self._status_lbl.setText(f"{len(pairs)} matching pair(s) found — double-click to go to file")
-
         for (pair_score,
              ring_id, ring_o, ring_name, ring_title,
              hat_id,  hat_o,  hat_name,  hat_title,

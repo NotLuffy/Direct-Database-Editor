@@ -1,12 +1,29 @@
 """
 CNC Direct Editor — Order Sheet Search parser and scorer.
 
-parse_order_row(text)          — parse a tab-separated I–M row from the order sheet
+parse_order_row(text)            — parse a tab-separated I–M row from the order sheet
 score_title_match(params, title) — score a program title against parsed order params
+describe_params(params)          — one-line human summary of what was parsed
+find_2pc_pairs(params, db_path)  — ring/hat pair search for 2PC orders
+
+Column semantics (order sheet I–M):
+    I — round size in inches
+    J — bolt pattern + thickness code:  <pattern>[-<pattern>]-<thick><H?>
+        thickness letter A = 1.00", +0.25" per letter (B=1.25" … H=2.75", I=3.00",
+        J=3.25"); a TRAILING H after another thickness token means "has hub"
+        (CH = 1.50"+hub, 10H = 10mm+hub, 1/2H = 0.50"+hub).  Flags: SR = steel
+        ring only, (2PC) = two-piece only, (1pc) = anything that is not 2PC.
+    K — center bore in mm; "CB/counterbore (depth)" = STEP part (non-2PC rows),
+        or the two piece CBs for 2PC rows
+    L — OB / hub diameter in mm.  A value here (without SR) means HC part.
+    M — thickness: disc + hub height ("1.50"+.50"HUB").  Authoritative for hub
+        height, but prone to hand-typed errors — cross-checked against J.
 """
 
 import re
 import verifier as _vfy
+
+_MM_TO_IN = 1.0 / 25.4
 
 # ---------------------------------------------------------------------------
 # Tolerances for order-sheet search (wider than machining verifier tolerances)
@@ -20,135 +37,278 @@ _TOL_HC_IN     = 0.10    # HC height: ±0.10" (order sheets often round)
 # Minimum score to include a result (0–100)
 MIN_SCORE = 20
 
+# Steel-ring title detector (shared by scorer and 2PC pairing)
+_STEEL_RE = re.compile(
+    r'\b(?:STEEL|STL)[\s._-]*RING\b|\bHCS-?\d*\b|\bSTL\b|\bSTEEL\s+S-\d+\b',
+    re.IGNORECASE)
+
+# Numeric token: decimal, fraction (7/8), or mixed (1 7/8)
+_NUM = r'(?:\d+\s+\d+/\d+|\d+/\d+|\d*\.?\d+)'
+
+
+def _to_float(v: str) -> float:
+    """Convert '1.75', '.50', '7/8' or '1 7/8' to float (strips quote marks)."""
+    v = v.strip().strip('"')
+    mixed = re.match(r'^(\d+)\s+(\d+)/(\d+)$', v)
+    if mixed:
+        return float(mixed.group(1)) + float(mixed.group(2)) / float(mixed.group(3))
+    frac = re.match(r'^(\d+)/(\d+)$', v)
+    if frac:
+        return float(frac.group(1)) / float(frac.group(2))
+    return float(v)
+
+
+def _inch(v: str, is_mm) -> float:
+    """Parse a numeric string, converting from mm when is_mm is truthy."""
+    val = _to_float(v)
+    return round(val * _MM_TO_IN, 4) if is_mm else val
+
+
+def _letter_in(ch: str) -> float:
+    """Column-J thickness letter: A=1.00", +0.25" per letter (H=2.75", J=3.25")."""
+    return 1.00 + 0.25 * (ord(ch.upper()) - ord('A'))
+
+
 # ---------------------------------------------------------------------------
 # Column M thickness parser
 # ---------------------------------------------------------------------------
 
+# Hand-typed noise that appears inside M and never carries spec data
+_M_NOISE_RE = re.compile(
+    r'\(\s*CR\s*\)'              # "(CR)" annotation
+    r'|-\s*CR\b'                 # "-CR" suffix
+    r'|\bTOP\s*PLATE\s*ONLY\b'
+    r'|\bBOTTOM\b'
+    r'|\bSLIP[-\s]?ON\b'
+    r'|\(\s*CUT\s*-[^)]*\)',     # "(CUT - 1.50")" note — NOT the (CUT A+A) pair form
+    re.IGNORECASE)
+
+# 2PC piece pair: "(A+B)", "(CUT A+A)", "(A+20MM)", "(20MM+20MM)"
+_PAIR_RE = re.compile(
+    r'\(\s*(?:CUT\s*)?([A-J]|\d+\.?\d*\s*MM)\s*\+\s*([A-J]|\d+\.?\d*\s*MM)\s*\)',
+    re.IGNORECASE)
+
+# disc + hub height with HUB keyword: "1.50"+.50"HUB", "10MM+3/8"HUB", "1/2H+.50"HUB"
+_M_HUB_RE = re.compile(
+    rf'^({_NUM})\s*(MM)?\s*"?\s*H?\s*\+\s*({_NUM})\s*(MM)?\s*"?\s*HUB')
+# disc + hub height, HUB keyword lost: "2.50" + 0.50"", "1.25"+.50"
+_M_PLUS_RE = re.compile(
+    rf'^({_NUM})\s*(MM)?\s*"?\s*\+\s*({_NUM})\s*(MM)?\s*"?$')
+# plain thickness: "1.00"", "19MM", "1 7/8"", "1.50"
+_M_PLAIN_RE = re.compile(rf'^({_NUM})\s*(MM)?\s*"?$')
+# J-style mm+hub token typed into M: "10H"
+_M_MMH_RE = re.compile(r'^(\d+\.?\d*)\s*(?:MM)?\s*H$')
+
+
+def _normalize_m(raw: str) -> str:
+    """Uppercase and repair the common hand-typed errors seen in column M."""
+    s = raw.strip().upper()
+    for q in '“”„':
+        s = s.replace(q, '"')
+    s = s.replace("’", '"').replace("'", '"')        # apostrophe used as inch mark
+    s = re.sub(r'[{}:`]', '', s)                     # shift-slips: .50{"HUB  .50:HUB
+    s = re.sub(r'\+\s*,\s*', '+.', s)                # "+,50"  → "+.50"
+    s = re.sub(r'\+{2,}', '+', s)                    # "++.50" → "+.50"
+    s = re.sub(r'\.{2,}', '.', s)                    # "+..50" → "+.50"
+    s = re.sub(r'\+\s*\.\s+(?=\d)', '+.', s)         # "+. 50" → "+.50"
+    s = re.sub(r'(\d)\s*M{1,3}\b"?', r'\1MM', s)     # 19M / 19MMM / 15MM" → 15MM
+    s = re.sub(r'\bHUBB+\b', 'HUB', s)
+    s = re.sub(r'\bSTEEL\s*RING\b', 'HUB', s)        # "+0.50" STEEL RING" = ring height
+    s = _M_NOISE_RE.sub(' ', s)
+    return ' '.join(s.split())
+
+
+def _pair_piece_in(tok: str) -> float | None:
+    """Finished piece thickness for one half of a (X+Y) pair.
+
+    mm values are finished thickness; stock LETTERS are blank sizes (finished
+    size is thinner by an unknown cut) → None so thickness isn't score-gated."""
+    tok = tok.strip().upper()
+    m = re.fullmatch(r'(\d+\.?\d*)\s*MM', tok)
+    if m:
+        return round(float(m.group(1)) * _MM_TO_IN, 4)
+    return None
+
+
 def _parse_thickness(raw: str) -> dict | None:
     """
     Parse column M thickness cell. Returns dict with keys:
-        disc_in   — disc (rotor) thickness in inches
-        hc_in     — hub-centric height in inches, or None
-        is_2pc    — True if this is a two-piece part
+        disc_in     — disc thickness in inches (total for 2PC)
+        hc_in       — hub-centric height in inches, or None
+        is_2pc      — True if a (X+Y) piece pair is present
+        piece_a_in / piece_b_in — individual 2PC piece thicknesses when known
+        assumed_hub — True when a hub is implied but its height was guessed
     Returns None on parse failure.
     """
-    s = raw.strip()
-    if not s:
+    s = _normalize_m(raw)
+    if not s or s == '?':
         return None
 
-    _MM_TO_IN = 1.0 / 25.4
+    pair = _PAIR_RE.search(s)
+    s_main = _PAIR_RE.sub(' ', s, count=1) if pair else s
+    # any parenthetical left after pair extraction is an aside, e.g. "(30.48MM)"
+    s_main = ' '.join(re.sub(r'\([^)]*\)', ' ', s_main).split())
+    if not s_main:
+        return None
 
-    def _f(v: str) -> float:
-        """Convert a value like '1.75', '.50', '7/8', '1 7/8' to float (strip quotes)."""
-        v = v.strip().strip('"')
-        # Mixed number: "1 7/8"
-        mixed = re.match(r'^(\d+)\s+(\d+)/(\d+)$', v)
-        if mixed:
-            return float(mixed.group(1)) + float(mixed.group(2)) / float(mixed.group(3))
-        # Pure fraction: "7/8"
-        frac = re.match(r'^(\d+)/(\d+)$', v)
-        if frac:
-            return float(frac.group(1)) / float(frac.group(2))
-        return float(v)
+    disc = hc = None
+    assumed_hub = False
 
-    def _inch(v: str, is_mm: bool) -> float:
-        """Parse a numeric string and convert from mm if flagged."""
-        val = _f(v)
-        return round(val * _MM_TO_IN, 4) if is_mm else val
-
-    # Numeric token: decimal, fraction (7/8), or mixed (1 7/8)
-    _NUM = r'(?:\d+\s+\d+/\d+|\d+/\d+|\d*\.?\d+)'
-
-    # ── MM-only value: "19MM", "19.5MM" — bare mm thickness, no hub ──────────
-    m = re.match(r'^(\d+\.?\d*)\s*MM$', s, re.IGNORECASE)
+    m = _M_MMH_RE.match(s_main)                      # "10H" — mm disc, hub implied
     if m:
-        return {"disc_in": round(float(m.group(1)) * _MM_TO_IN, 4),
-                "hc_in": None, "is_2pc": False}
+        disc = round(float(m.group(1)) * _MM_TO_IN, 4)
+        hc   = 0.50
+        assumed_hub = True
+    if disc is None:
+        m = _M_HUB_RE.match(s_main)
+        if m:
+            disc = _inch(m.group(1), m.group(2))
+            hc   = _inch(m.group(3), m.group(4))
+    if disc is None:
+        m = _M_PLUS_RE.match(s_main)
+        if m:
+            disc = _inch(m.group(1), m.group(2))
+            hc   = _inch(m.group(3), m.group(4))
+    if disc is None:
+        m = _M_PLAIN_RE.match(s_main)
+        if m:
+            disc = _inch(m.group(1), m.group(2))
+    if disc is None:
+        return None
 
-    # ── MM+HC: "19MM+0.50"HUB" or "19MM+12MMHUB" ─────────────────────────────
-    m = re.match(
-        r'^(\d+\.?\d*)\s*MM\s*\+\s*(\d*\.?\d+)\s*(MM)?"?\s*HUB',
-        s, re.IGNORECASE)
-    if m:
-        disc  = round(float(m.group(1)) * _MM_TO_IN, 4)
-        hc_is_mm = bool(m.group(3))
-        hc    = _inch(m.group(2), hc_is_mm)
-        return {"disc_in": disc, "hc_in": hc, "is_2pc": False}
+    piece_a = piece_b = None
+    if pair:
+        piece_a = _pair_piece_in(pair.group(1))
+        piece_b = _pair_piece_in(pair.group(2))
+        # letter + mm mix: the letter piece finishes at total − mm piece
+        if piece_a is None and piece_b is not None and disc - piece_b > 0.1:
+            piece_a = round(disc - piece_b, 4)
+        elif piece_b is None and piece_a is not None and disc - piece_a > 0.1:
+            piece_b = round(disc - piece_a, 4)
 
-    # Pattern A: "1.75"+.50"HUB", "7/8"+.50"HUB" — HC disc with HUB keyword
-    m = re.match(
-        rf'^({_NUM})"?\s*\+\s*({_NUM})"?\s*HUB',
-        s, re.IGNORECASE)
-    if m:
-        return {"disc_in": _f(m.group(1)), "hc_in": _f(m.group(2)), "is_2pc": False}
-
-    # Pattern B: "1.50"+0.50"(B+A)", "(B+C)", "(A+B)" etc — 2PC with HC, any letter pair
-    m = re.match(
-        rf'^({_NUM})"?\s*\+\s*({_NUM})"?\s*\([A-Z]\+[A-Z]\)',
-        s, re.IGNORECASE)
-    if m:
-        disc = _f(m.group(1)); hc = _f(m.group(2))
-        return {"disc_in": disc, "hc_in": hc, "is_2pc": True,
-                "piece_a_in": disc, "piece_b_in": hc}
-
-    # Pattern C: "1.25" (20mm+20mm)" — 2PC no HC (individual mm thicknesses)
-    m = re.match(
-        rf'^({_NUM})"?\s*\(([\d.]+)\s*mm\s*\+\s*([\d.]+)\s*mm\s*\)',
-        s, re.IGNORECASE)
-    if m:
-        piece_a = round(float(m.group(2)) * _MM_TO_IN, 4)
-        piece_b = round(float(m.group(3)) * _MM_TO_IN, 4)
-        return {"disc_in": _f(m.group(1)), "hc_in": None, "is_2pc": True,
-                "piece_a_in": piece_a, "piece_b_in": piece_b}
-
-    # Pattern D: "1.25"+0.50"", "7/8"+.50"" — HC disc, no HUB, no bracket
-    m = re.match(
-        rf'^({_NUM})"?\s*\+\s*({_NUM})"?$',
-        s, re.IGNORECASE)
-    if m:
-        return {"disc_in": _f(m.group(1)), "hc_in": _f(m.group(2)), "is_2pc": False}
-
-    # Pattern E: plain value "1.00"", "7/8"", "1 7/8""
-    m = re.match(rf'^({_NUM})"?$', s)
-    if m:
-        return {"disc_in": _f(m.group(1)), "hc_in": None, "is_2pc": False}
-
-    return None
+    return {"disc_in": disc, "hc_in": hc, "is_2pc": bool(pair),
+            "piece_a_in": piece_a, "piece_b_in": piece_b,
+            "assumed_hub": assumed_hub}
 
 
 # ---------------------------------------------------------------------------
 # Column K CB parser
 # ---------------------------------------------------------------------------
 
+def _leading_float(text: str) -> float | None:
+    m = re.match(r'\s*(\d+\.?\d*)', text)
+    return float(m.group(1)) if m else None
+
+
 def _parse_cb(raw: str) -> dict | None:
     """
     Parse column K center-bore cell. Returns dict with keys:
-        cb_mm       — primary (outer) CB in mm
-        is_step     — True if two CB values (step part)
-        step_cb_mm  — inner CB in mm for STEP parts, else None
+        cb_mm         — primary (outer) CB in mm
+        is_step       — True if two bore values (STEP part / 2PC piece CBs)
+        step_cb_mm    — inner counterbore in mm, else None
+        step_depth_in — step depth in inches when noted, e.g. "110/74 (.40 STEP)"
     Returns None on parse failure.
     """
-    s = raw.strip()
-    if not s:
+    s = raw.strip().upper()
+    if not s or s == '?':
         return None
 
-    # Extract just the leading numeric portion from each part
-    # e.g. "74 (.40 DEEP STEP)" → 74.0, "110" → 110.0
-    def _leading_float(text: str) -> float:
-        m = re.match(r'[\s]*(\d+\.?\d*)', text)
-        if not m:
-            raise ValueError(f"No number in: {text!r}")
-        return float(m.group(1))
-
-    parts = [p.strip() for p in s.split("/")]
-    try:
-        cb_mm = _leading_float(parts[0])
-        if len(parts) >= 2:
-            step_cb = _leading_float(parts[1])
-            return {"cb_mm": cb_mm, "is_step": True, "step_cb_mm": step_cb}
-        return {"cb_mm": cb_mm, "is_step": False, "step_cb_mm": None}
-    except (ValueError, IndexError):
+    parts = s.split("/", 1)
+    cb_mm = _leading_float(parts[0])
+    if cb_mm is None:
         return None
+
+    if len(parts) == 2:
+        second = _leading_float(parts[1])
+        # Both sides must look like bore diameters (mm) — guards against a
+        # fraction thickness typed into K such as '3 1/16"'
+        if second is not None and cb_mm >= 20 and second >= 20:
+            tail = parts[1][re.match(r'\s*\d+\.?\d*', parts[1]).end():]
+            depth = None
+            mnum = re.search(r'(\d*\.?\d+)', tail)
+            if mnum:
+                depth = float(mnum.group(1))
+                if depth >= 3:          # "75 STEP" means .75" — decimal dropped
+                    depth /= 100.0
+            return {"cb_mm": cb_mm, "is_step": True,
+                    "step_cb_mm": second, "step_depth_in": depth}
+
+    return {"cb_mm": cb_mm, "is_step": False,
+            "step_cb_mm": None, "step_depth_in": None}
+
+
+# ---------------------------------------------------------------------------
+# Column J parser
+# ---------------------------------------------------------------------------
+
+_J_FRAC_DENOMS = {2, 3, 4, 8, 16}   # sane thickness fractions (rejects "131/108")
+
+
+def _parse_j(col_j: str) -> dict:
+    """
+    Parse column J: flags (SR / 2PC / 1PC) and thickness tokens.
+
+    Token forms:  letter code C / CH / E9 (A=1.00" +0.25"/letter, trailing H=hub),
+    mm+hub 10H / 10.6H, fraction 1/2H / 3/4", explicit inches 1.50", mm 19MM, HC.
+    Bare bolt-pattern numbers (5450, 84.1, 131/108, -2 suffix) are ignored.
+
+    When TWO thickness values appear ("AH-1.50""), the first is the disc and the
+    trailing one is the hub height (matches M "1.00"+1.50"HUB").  A bare H after
+    another thickness token is a hub marker ("1/2-H"); bare H alone is 2.75".
+    """
+    up = col_j.upper()
+    is_sr  = bool(re.search(r'\bSR\b', up))
+    is_2pc = bool(re.search(r'2\s*PC', up))
+    is_1pc = bool(re.search(r'1\s*PC', up))
+
+    core = re.sub(r'\([^)]*\)', ' ', up)      # drop (SPACERS)/(2PC)/(1pc)
+    core = re.sub(r'\bSR\b', ' ', core)
+
+    vals: list[float] = []
+    has_hub = False
+    tokens = [t for t in re.split(r'[\s-]+', core) if t]
+    for tok in tokens[1:]:                    # tokens[0] is always the bolt pattern
+        val = None
+        hub = None
+        if tok == 'H' and vals:                           # detached hub marker: "1/2-H"
+            has_hub = True
+            continue
+        m = re.fullmatch(r'([A-K])\d?(H)?', tok)
+        if m:                                             # C / CH / E9 / bare H (=2.75")
+            val = _letter_in(m.group(1))
+            hub = bool(m.group(2))
+        elif re.fullmatch(r'(\d+(?:\.\d+)?)\s*(?:MM)?H', tok):   # 10H / 10.6H — mm + hub
+            mmv = float(re.match(r'\d+(?:\.\d+)?', tok).group(0))
+            if mmv <= 40:                     # 96H etc. is a bore, not a thickness
+                val = round(mmv * _MM_TO_IN, 4)
+                hub = True
+        elif re.fullmatch(r'(\d+(?:\.\d+)?)MM', tok):            # 19MM
+            val = round(float(tok[:-2]) * _MM_TO_IN, 4)
+            hub = False
+        elif tok == 'HC':
+            has_hub = True
+        else:
+            m = re.fullmatch(r'((?:\d+\s+)?\d+/\d+)"?(H)?', tok)  # 1/2H / 3/4"
+            if m:
+                num, den = m.group(1).rsplit('/', 1)
+                if int(den) in _J_FRAC_DENOMS:
+                    val = _to_float(m.group(1))
+                    hub = bool(m.group(2))
+            else:
+                m = re.fullmatch(r'(\d*\.\d+|\d+)"', tok)         # 1.50" (quote required)
+                if m:
+                    val = float(m.group(1))
+                    hub = False
+        if val is not None:
+            vals.append(val)
+            if hub:
+                has_hub = True
+
+    disc_in = vals[0] if vals else None
+    hub_in  = vals[-1] if len(vals) >= 2 else None   # "AH-1.50"" → hub height 1.50"
+
+    return {"is_sr": is_sr, "is_2pc": is_2pc, "is_1pc": is_1pc,
+            "disc_in": disc_in, "hub_in": hub_in, "has_hub": has_hub}
 
 
 # ---------------------------------------------------------------------------
@@ -158,93 +318,154 @@ def _parse_cb(raw: str) -> dict | None:
 def parse_order_row(text: str) -> dict | None:
     """
     Parse a tab-separated row from order sheet columns I–M.
+    Returns dict (see keys below) or None on failure.
 
-    Column I: round size (e.g. "7", "9.5")
-    Column J: bolt pattern (e.g. "5550-5450-A", "8170-8200-DH") — H suffix = hub hint
-    Column K: CB in mm (e.g. "87.1", "125/115" for STEP)
-    Column L: OB/hub diameter in mm, or empty
-    Column M: thickness (e.g. "1.00"", "1.75"+.50"HUB")
-
-    Returns dict or None on failure.
+    Robust to hand-typed errors: M typos are normalized, and when M is
+    unreadable the thickness falls back to the column-J code; when J and M
+    disagree both values are accepted for matching.  Any repair is recorded
+    in the returned "warnings" list.
     """
     try:
         cols = text.strip().split("\t")
-        # Also try comma-separated if no tabs found (paste from some apps)
-        if len(cols) < 5:
+        if len(cols) < 4:
             cols = text.strip().split(",")
+        if len(cols) == 4:
+            cols = cols[:3] + [""] + cols[3:]    # L omitted (flat part)
         if len(cols) < 5:
             return None
 
-        col_i = cols[0].strip()
-        col_j = cols[1].strip()
-        col_k = cols[2].strip()
-        col_l = cols[3].strip()
-        col_m = cols[4].strip()
+        col_i, col_j, col_k, col_l, col_m = (c.strip() for c in cols[:5])
 
-        # I — round size
-        round_in = float(col_i)
+        m = re.match(r'(\d+(?:\.\d+)?)', col_i)
+        if not m:
+            return None
+        round_in = float(m.group(1))
 
-        # J — bolt pattern: H suffix = hub hint, SR = steel ring, 2PC anywhere = two-piece
-        bolt_parts = col_j.split("-")
-        bolt_has_hub_hint = bool(bolt_parts) and bolt_parts[-1].upper().endswith("H")
-        is_steel_ring = bool(re.search(r'\bSR\b', col_j, re.IGNORECASE))
-        col_j_is_2pc  = bool(re.search(r'2\s*PC', col_j, re.IGNORECASE))
-
-        # K — CB
+        j = _parse_j(col_j)
         cb_data = _parse_cb(col_k)
         if cb_data is None:
             return None
+        m = re.match(r'(\d+(?:\.\d+)?)', col_l)
+        ob_mm = float(m.group(1)) if m else None
 
-        # L — OB (optional)
-        ob_mm = float(col_l) if col_l else None
+        warnings: list[str] = []
+        alt_disc_in = None
+        th = _parse_thickness(col_m)
+        if th is None:
+            if j["disc_in"] is None:
+                return None
+            hub = j["has_hub"] or ob_mm is not None
+            hc  = (j["hub_in"] or 0.50) if hub else None
+            th = {"disc_in": j["disc_in"], "hc_in": hc,
+                  "is_2pc": False, "piece_a_in": None, "piece_b_in": None}
+            warnings.append(
+                f'Thickness "{col_m}" unreadable — using {j["disc_in"]:g}" from '
+                f'bolt-pattern code' + (f' + {hc:g}" hub' if hc else ''))
+        else:
+            if th.pop("assumed_hub", False):
+                if j["hub_in"] is not None:
+                    th["hc_in"] = j["hub_in"]
+                else:
+                    warnings.append('Hub height not given in thickness — assumed 0.50"')
+            if j["disc_in"] is not None and abs(j["disc_in"] - th["disc_in"]) > 0.07:
+                alt_disc_in = j["disc_in"]
+                warnings.append(
+                    f'J says {j["disc_in"]:g}" but M says {th["disc_in"]:g}" '
+                    f'— using M, matching either (check for typo)')
+            if (j["hub_in"] is not None and th.get("hc_in") is not None
+                    and abs(j["hub_in"] - th["hc_in"]) > 0.07):
+                warnings.append(
+                    f'J hub {j["hub_in"]:g}" ≠ M hub {th["hc_in"]:g}" '
+                    f'— using M (check for typo)')
 
-        # M — thickness
-        th_data = _parse_thickness(col_m)
-        if th_data is None:
-            return None
-
-        # If column J says 2PC, override whatever column M parsed
-        if col_j_is_2pc:
-            th_data["is_2pc"] = True
+        is_2pc = bool(th.get("is_2pc")) or j["is_2pc"]
+        if j["is_1pc"] and is_2pc:
+            is_2pc = False
+            warnings.append('J says 1PC but thickness looks 2PC — treating as 1PC')
+        is_steel_ring = j["is_sr"]
 
         # Steel rings: ignore hub height and OB — search on round, CB, disc only
         if is_steel_ring:
             ob_mm            = None
-            th_data["hc_in"] = None
+            th["hc_in"]      = None
 
         # 2PC pairing:
         #   HC 2PC  → col K = A piece CB, col L = B piece hub bore CB, hc_in = hub height
-        #   Std 2PC → col K may have step (A/B CBs via /), no HC, no OB needed
-        is_hc_2pc = th_data["is_2pc"] and th_data.get("hc_in") is not None
-        if th_data["is_2pc"] and not is_hc_2pc:
+        #   Std 2PC → col K may carry both piece CBs via /, no HC, no OB needed
+        is_hc_2pc = is_2pc and th.get("hc_in") is not None
+        if is_2pc and not is_hc_2pc:
             ob_mm            = None
-            th_data["hc_in"] = None
-
-        # For HC 2PC: ob_mm (col L) is the hub bore CB of the B piece — keep it
+            th["hc_in"]      = None
         hub_cb_mm = ob_mm if is_hc_2pc else None
         if is_hc_2pc:
             ob_mm = None   # not an OB for scoring purposes
 
+        # Part type — drives the hard search filters:
+        #   SR  → steel-ring files only
+        #   2PC → 2PC files only (ring/hat pairing)
+        #   HC  → hub files only (OB in L, hub height from M)
+        #   STD → flat parts: never 2PC, never HC (explicit "1pc" lands here too)
+        if is_steel_ring:
+            part_type = "SR"
+        elif is_2pc:
+            part_type = "2PC"
+        elif ob_mm is not None or th.get("hc_in") is not None:
+            part_type = "HC"
+            if th.get("hc_in") is None:
+                warnings.append('OB given but no hub height in M — hub height unchecked')
+            elif ob_mm is None:
+                warnings.append('Hub in M but no OB value in column L')
+        else:
+            part_type = "STD"
+            if j["has_hub"]:
+                warnings.append('J suggests a hub but L and M do not — treating as flat')
+
         return {
             "round_in":          round_in,
-            "bolt_has_hub_hint": bolt_has_hub_hint,
+            "part_type":         part_type,
+            "bolt_has_hub_hint": j["has_hub"],
             "is_steel_ring":     is_steel_ring,
+            "is_1pc":            j["is_1pc"],
             "cb_mm":             cb_data["cb_mm"],
             "is_step":           cb_data["is_step"],
             "step_cb_mm":        cb_data["step_cb_mm"],
+            "step_depth_in":     cb_data["step_depth_in"],
             "ob_mm":             ob_mm,
-            "disc_in":           th_data["disc_in"],
-            "hc_in":             th_data["hc_in"],
-            "is_2pc":            th_data["is_2pc"],
+            "disc_in":           th["disc_in"],
+            "alt_disc_in":       alt_disc_in,
+            "hc_in":             th["hc_in"],
+            "is_2pc":            is_2pc,
             "is_hc_2pc":         is_hc_2pc,
             # HC 2PC: hub bore CB for the B (hub/hat) piece, from col L
             "hub_cb_mm":         hub_cb_mm,
             # Individual piece thicknesses for standard 2PC pairing
-            "piece_a_in":        th_data.get("piece_a_in"),
-            "piece_b_in":        th_data.get("piece_b_in"),
+            "piece_a_in":        th.get("piece_a_in"),
+            "piece_b_in":        th.get("piece_b_in"),
+            "warnings":          warnings,
         }
-    except (ValueError, IndexError, TypeError):
+    except (ValueError, IndexError, TypeError, AttributeError):
         return None
+
+
+def describe_params(p: dict) -> str:
+    """One-line human summary of a parsed order (shown above its results)."""
+    bits = [p["part_type"], f'{p["round_in"]:g}" rnd', f'CB {p["cb_mm"]:g}mm']
+    if p["is_step"] and not p["is_2pc"]:
+        s = f'STEP {p["step_cb_mm"]:g}mm'
+        if p.get("step_depth_in"):
+            s += f' × {p["step_depth_in"]:.2f}" deep'
+        bits.append(s)
+    if p["is_2pc"] and p.get("step_cb_mm"):
+        bits.append(f'piece CBs {p["cb_mm"]:g}/{p["step_cb_mm"]:g}mm')
+    if p.get("ob_mm") is not None:
+        bits.append(f'OB {p["ob_mm"]:g}mm')
+    if p.get("hub_cb_mm") is not None:
+        bits.append(f'hub CB {p["hub_cb_mm"]:g}mm')
+    d = f'{p["disc_in"]:g}"'
+    if p.get("hc_in") is not None:
+        d += f' + {p["hc_in"]:g}" hub'
+    bits.append(d)
+    return "  ·  ".join(bits)
 
 
 # ---------------------------------------------------------------------------
@@ -255,9 +476,11 @@ def score_title_match(params: dict, title: str) -> tuple[int, list[str]]:
     """
     Score a program title against parsed order params.
 
+    Part type is a HARD filter: SR orders only see steel-ring files, HC orders
+    only hub files, STD/1pc orders never see 2PC / HC / steel-ring files, and
+    STEP orders only STEP files.  Within the allowed type, closeness is scored.
+
     Returns (score_0_to_100, matched_fields_list).
-    matched_fields lists what passed tolerance (e.g. ["Round 9.5 ✓", "CB 125.0 ✓"]).
-    score < MIN_SCORE → treat as no match.
     """
     if not title:
         return 0, []
@@ -266,20 +489,39 @@ def score_title_match(params: dict, title: str) -> tuple[int, list[str]]:
     if specs is None:
         return 0, []
 
-    raw       = 0
-    matched   = []
-    missed    = []
+    p_type    = params.get("part_type", "STD")
+    p_is_step = bool(params.get("is_step")) and not params.get("is_2pc")
 
-    # ── Round size (30 pts) ──────────────────────────────────────────────────
+    t_is_step = bool(specs.get("is_step")) or bool(re.search(r'\bSTEP\b', title, re.IGNORECASE))
+    t_is_2pc  = bool(re.search(r'-*2\s*PC\b', title, re.IGNORECASE))
+    t_is_sr   = bool(specs.get("is_steel_ring")) or bool(_STEEL_RE.search(title))
+    t_has_hc  = specs.get("hc_height_in") is not None
+
+    # ── Hard part-type gates ─────────────────────────────────────────────────
+    if p_type == "SR":
+        if not t_is_sr:
+            return 0, []
+    elif t_is_sr:
+        return 0, []
+    if t_is_2pc != (p_type == "2PC"):
+        return 0, []
+    if p_type == "HC" and not t_has_hc:
+        return 0, []
+    if p_type == "STD" and t_has_hc:
+        return 0, []
+    if p_type in ("STD", "HC") and p_is_step != t_is_step:
+        return 0, []
+
+    raw     = 0
+    matched = []
+    missed  = []
+
+    # ── Round size (30 pts, hard gate) ───────────────────────────────────────
     t_round = specs.get("round_size_in")
     if t_round is not None and abs(t_round - params["round_in"]) <= _TOL_ROUND_IN:
         raw += 30
         matched.append(f'Round {params["round_in"]}" ✓')
     else:
-        missed.append(f'Round {params["round_in"]}" ✗'
-                      + (f' (title: {t_round}")' if t_round else ''))
-        # Round size is so discriminating that if it doesn't match at all,
-        # cap the total score to avoid noise in results
         return 0, []
 
     # ── CB (25 pts) ──────────────────────────────────────────────────────────
@@ -291,62 +533,39 @@ def score_title_match(params: dict, title: str) -> tuple[int, list[str]]:
     else:
         missed.append(f"CB {p_cb:.1f}mm ✗" + (f" (title: {t_cb:.1f}mm)" if t_cb else ""))
 
-    # ── Disc thickness (15 pts) ──────────────────────────────────────────────
+    # ── Disc thickness (15 pts) — J/M conflict accepts either value ─────────
     t_len = specs.get("length_in")
-    p_len = params["disc_in"]
-    if t_len is not None and abs(t_len - p_len) <= _TOL_DISC_IN:
+    cands = [params["disc_in"]]
+    if params.get("alt_disc_in") is not None:
+        cands.append(params["alt_disc_in"])
+    if t_len is not None and any(abs(t_len - c) <= _TOL_DISC_IN for c in cands):
         raw += 15
-        matched.append(f'Disc {p_len}" ✓')
+        matched.append(f'Disc {params["disc_in"]}" ✓')
     else:
-        missed.append(f'Disc {p_len}" ✗' + (f' (title: {t_len:.3f}")' if t_len else ""))
+        missed.append(f'Disc {params["disc_in"]}" ✗'
+                      + (f' (title: {t_len:.3f}")' if t_len else ""))
 
-    # ── Part type (15 pts) ───────────────────────────────────────────────────
-    p_is_step       = params["is_step"]
-    p_is_2pc        = params["is_2pc"]
-    p_is_steel_ring = params.get("is_steel_ring", False)
-    p_has_hc        = params["hc_in"] is not None
+    # ── Part type (15 pts — gates above guarantee the match) ─────────────────
+    raw += 15
+    matched.append({"SR": "Steel Ring ✓", "HC": "HC ✓",
+                    "2PC": "2PC ✓", "STD": "STD ✓"}[p_type]
+                   if not p_is_step else "STEP ✓")
 
-    _STEEL_RE = re.compile(
-        r'\b(?:STEEL|STL)[\s._-]*RING\b|\bHCS-?\d*\b|\bSTEEL\s+S-\d+\b', re.IGNORECASE)
-    t_is_step       = bool(re.search(r'\bSTEP\b', title, re.IGNORECASE))
-    t_is_2pc        = bool(re.search(r'-*2\s*PC\b', title, re.IGNORECASE))
-    t_is_steel_ring = bool(_STEEL_RE.search(title))
-    t_has_hc        = specs.get("hc_height_in") is not None
-
-    type_score = 0
-    type_label = ""
-
-    if p_is_steel_ring and t_is_steel_ring:
-        type_score = 15; type_label = "Steel Ring ✓"
-    elif p_is_steel_ring and not t_is_steel_ring:
-        missed.append("Steel Ring ✗")
-    elif not p_is_steel_ring and t_is_steel_ring:
-        # Order is not SR but title is — penalize hard
-        missed.append("Type ✗ (title is Steel Ring)")
-    elif p_is_step and t_is_step:
-        type_score = 15; type_label = "STEP ✓"
-    elif p_is_2pc and t_is_2pc:
-        type_score = 15; type_label = "2PC ✓"
-    elif p_has_hc and t_has_hc and not p_is_2pc and not t_is_2pc:
-        type_score = 15; type_label = "HC ✓"
-    elif not p_has_hc and not p_is_2pc and not p_is_step and \
-         not t_has_hc and not t_is_2pc and not t_is_step:
-        type_score = 15; type_label = "STD ✓"
-    else:
-        # Partial: at least both have or both lack a hub
-        if p_has_hc == t_has_hc:
-            type_score = 7; type_label = "Type ~"
+    # ── STEP counterbore (15 pts, only for step orders) ──────────────────────
+    max_step = 15 if (p_is_step and params.get("step_cb_mm") is not None) else 0
+    if max_step:
+        t_step = specs.get("step_mm")
+        p_step = params["step_cb_mm"]
+        if t_step is not None and abs(t_step - p_step) <= _TOL_CB_MM:
+            raw += 15
+            matched.append(f"Counterbore {p_step:.1f}mm ✓")
         else:
-            missed.append("Type ✗")
-
-    raw += type_score
-    if type_label:
-        matched.append(type_label)
+            missed.append(f"Counterbore {p_step:.1f}mm ✗"
+                          + (f" (title: {t_step:.1f}mm)" if t_step else ""))
 
     # ── OB (10 pts, only when order specifies OB) ────────────────────────────
     has_ob_field = params["ob_mm"] is not None
     max_ob = 10 if has_ob_field else 0
-
     if has_ob_field:
         t_ob = specs.get("ob_mm") or specs.get("step_mm")
         p_ob = params["ob_mm"]
@@ -359,7 +578,6 @@ def score_title_match(params: dict, title: str) -> tuple[int, list[str]]:
     # ── HC height (5 pts, only when order specifies HC) ──────────────────────
     has_hc_field = params["hc_in"] is not None
     max_hc = 5 if has_hc_field else 0
-
     if has_hc_field:
         t_hc = specs.get("hc_height_in")
         p_hc = params["hc_in"]
@@ -370,12 +588,10 @@ def score_title_match(params: dict, title: str) -> tuple[int, list[str]]:
             missed.append(f'HC {p_hc:.3f}" ✗' + (f' (title: {t_hc:.3f}")' if t_hc else ""))
 
     # ── Normalize to 0–100 ───────────────────────────────────────────────────
-    max_possible = 30 + 25 + 15 + 15 + max_ob + max_hc   # 85–100 depending on part type
+    max_possible = 30 + 25 + 15 + 15 + max_step + max_ob + max_hc
     score = round(raw * 100 / max_possible) if max_possible else 0
 
-    # Append missed fields for tooltip context
-    all_fields = matched + missed
-    return score, all_fields
+    return score, matched + missed
 
 
 # ---------------------------------------------------------------------------
@@ -398,8 +614,10 @@ def _score_2pc_piece(round_in: float, cb_mm: float, thickness_in: float | None,
     if specs is None:
         return 0, []
 
-    # Must be a 2PC title
+    # Must be a 2PC title, and never a steel ring
     if not re.search(r'-*2\s*PC\b', title, re.IGNORECASE):
+        return 0, []
+    if _STEEL_RE.search(title):
         return 0, []
 
     # Check HC presence two ways: parsed specs AND raw title keyword
@@ -456,7 +674,8 @@ def find_2pc_pairs(params: dict, db_path: str) -> list[tuple]:
       - params["cb_mm"]      as the ring piece CB
       - params["step_cb_mm"] as the bell/hat CB (if present), else same as cb_mm
       - params["piece_a_in"] / params["piece_b_in"] for individual piece thicknesses
-        (falls back to disc_in if not available)
+        (thickness check is skipped for a piece whose finished size is unknown,
+        e.g. stock-letter pairs like "(A+B)")
       - params["round_in"]   for both pieces
 
     Returns list of (pair_score, ring_id, ring_o, ring_name, ring_title,
@@ -482,11 +701,12 @@ def find_2pc_pairs(params: dict, db_path: str) -> list[tuple]:
         require_hc_b = True    # B piece must have HC in title
         forbid_hc_a  = True    # A piece must NOT have HC in title
     else:
-        # Standard 2PC: step CBs from col K (A/B), individual thicknesses from col M
+        # Standard 2PC: piece CBs from col K (A/B via /), thicknesses from col M
+        # when the pair notation gives finished sizes (mm); stock letters → None
         cb_a         = params["cb_mm"]
         cb_b         = params.get("step_cb_mm") or params["cb_mm"]
-        thick_a      = params.get("piece_a_in") or params["disc_in"]
-        thick_b      = params.get("piece_b_in") or params["disc_in"]
+        thick_a      = params.get("piece_a_in")
+        thick_b      = params.get("piece_b_in")
         require_hc_b = False
         forbid_hc_a  = False
 

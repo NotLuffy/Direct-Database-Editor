@@ -997,7 +997,11 @@ class EditorPanel(QWidget):
         pc_exp = result.get("pcode_expected")
         found_str = f"P{op1_p}/P{op2_p}" if op1_p and op2_p else "—"
         exp_str = f"P{pc_exp[0]}/P{pc_exp[1]}" if pc_exp else "—"
-        pc_detail = f"Found: {found_str}  Expected: {exp_str}"
+        pc_note = result.get("pcode_note")
+        if pc_note and pc_ok is None:
+            pc_detail = f"Found: {found_str}  ({pc_note})"
+        else:
+            pc_detail = f"Found: {found_str}  Expected: {exp_str}"
         pc_lathe = result.get("pcode_lathe") or ""
         if pc_lathe:
             pc_detail += f"  ({pc_lathe})"

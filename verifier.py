@@ -245,6 +245,24 @@ _LATHE1_PC  = {
 #   17mm disc → P7/P8 (dedicated, alternate to P13/P14 at 0.75")
 _LATHE1_ALT_PC = {0.50: (3, 4), 0.75: (7, 8)}
 
+# ---------------------------------------------------------------------------
+# HC P-codes: "NNMM HC" parts use a DEDICATED registration scheme, not the
+# disc-thickness tables above (an HC disc + 0.50" hub doesn't map to a disc-only
+# P-code).  Keyed by the MM disc size in the title -> accepted (OP1 P#, OP2 P#).
+# Source: survey of repository programs (dominant pair per size, confirmed).
+# Sizes not listed have no established mapping yet and are left not-applicable
+# so they don't FAIL against the wrong (disc-only) table.
+# ---------------------------------------------------------------------------
+_HC_PC_ACCEPT = {
+    15: (15, 16),
+    17: (17, 18),
+    20: (17, 18),
+}
+# Integer "NNMM HC" disc-size token (mm immediately before HC). The (?<![\d.])
+# guard excludes decimals like ".75MM HC"/"1.50MM HC" (inch parts) and bore
+# dimensions such as "73.1MM" that are not the disc size.
+_HC_MM_RE = re.compile(r'(?<![\d.])(\d{1,2})\s*MM\s*-?\s*HC\b', re.IGNORECASE)
+
 # Lathe 2/3: thin MM registrations
 #   ~12/13/15mm disc (no HC) → P1/P2
 #   ~17/20/22mm disc (no HC) → P3/P4
@@ -2066,8 +2084,31 @@ def verify_file(path: str, title: str, o_number: str = None) -> dict:
     pcode_lathe    = None
     pcode_expected = None
     pcode_implied  = None
+    pcode_note     = None
     round_size     = specs.get("round_size_in", 0.0)
-    if total_thickness and total_thickness >= 0.20:
+
+    # --- "NNMM HC" parts: dedicated P-code scheme (see _HC_PC_ACCEPT) ---
+    # HC disc + 0.50" hub does not map onto the disc-thickness tables, so check
+    # these against the confirmed accepted pair instead.  Unmapped HC sizes are
+    # left not-applicable rather than FAILing against the wrong table.
+    _hc_mm   = _HC_MM_RE.search(title)
+    is_hc_mm = _hc_mm is not None
+    if is_hc_mm:
+        hc_mm_size = int(_hc_mm.group(1))
+        accepted   = _HC_PC_ACCEPT.get(hc_mm_size)
+        if accepted is None:
+            pcode_note = (f"{hc_mm_size}MM HC: P-code mapping not established "
+                          "— not checked")
+        elif op1_p is not None and op2_p is not None:
+            if (op1_p, op2_p) == accepted:
+                pcode_ok       = True
+                pcode_lathe    = _lathe_label_for_round(round_size)
+                pcode_expected = accepted
+            else:
+                pcode_ok       = False
+                pcode_expected = accepted
+        # no P-codes found (G54/G55 offsets) -> pcode_ok stays None (N/A)
+    elif total_thickness and total_thickness >= 0.20:
         t_key    = round(total_thickness * 4) / 4
         pc_table = _pc_table_for_round(round_size)
         exp_pair = pc_table.get(t_key)
@@ -2095,7 +2136,7 @@ def verify_file(path: str, title: str, o_number: str = None) -> dict:
     pcode_wrong_lathe           = False
     pcode_wrong_lathe_label     = None
     pcode_wrong_lathe_thickness = None
-    if pcode_ok is False and op1_p is not None and op2_p is not None:
+    if pcode_ok is False and not is_hc_mm and op1_p is not None and op2_p is not None:
         # Check the table that was NOT used for the primary check
         if round_size <= 6.50:
             other_table = _LATHE23_PC
@@ -2218,6 +2259,7 @@ def verify_file(path: str, title: str, o_number: str = None) -> dict:
         "pcode_lathe":                 pcode_lathe,
         "pcode_expected":              pcode_expected,
         "pcode_implied":               pcode_implied,
+        "pcode_note":                  pcode_note,
         "pcode_wrong_lathe":           pcode_wrong_lathe,
         "pcode_wrong_lathe_label":     pcode_wrong_lathe_label,
         "pcode_wrong_lathe_thickness": pcode_wrong_lathe_thickness,

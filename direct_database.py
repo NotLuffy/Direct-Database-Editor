@@ -41,6 +41,127 @@ def checkpoint_and_close(db_path: str):
 
 
 # ---------------------------------------------------------------------------
+# Drive-letter unification
+# ---------------------------------------------------------------------------
+
+def resolve_drive_path(path: str) -> tuple[str, bool]:
+    """Google Drive mounts under a changing letter (G:/P:/Q:...).  If `path`
+    doesn't exist, look for the same path on every other drive letter.
+    Returns (usable_path, changed)."""
+    if not path or os.path.exists(path):
+        return path, False
+    drive, tail = os.path.splitdrive(path)
+    if not tail or not drive:
+        return path, False
+    for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+        cand = f"{letter}:{tail}"
+        if cand != path and os.path.exists(cand):
+            return cand, True
+    return path, False
+
+
+def unify_drive_letters(db_path: str, scan_folders: list) -> dict:
+    """Re-point records left over from old Google-Drive letters.
+
+    Any record whose path equals a scan folder's path on a DIFFERENT drive
+    letter is the same physical file: re-point it to the current letter, or —
+    when a current-letter record already exists — merge into it (preserving
+    status, notes, earliest index date and revision history) and delete the
+    stale row.  Idempotent and cheap when there is nothing to do.
+    """
+    stats = {"repointed": 0, "merged": 0}
+    tails = []
+    for folder in scan_folders or []:
+        drive, tail = os.path.splitdrive(folder)
+        if drive and tail:
+            tails.append((drive, os.path.normcase(tail.rstrip("\\/"))))
+    if not tails:
+        return stats
+
+    conn = get_connection(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT id, file_path, source_folder, status, notes, index_date "
+            "FROM files").fetchall()
+
+        def _affected(row) -> bool:
+            rdrive, rtail = os.path.splitdrive(row["file_path"])
+            rtail_nc = os.path.normcase(rtail)
+            for drive, tail_nc in tails:
+                if (os.path.normcase(rdrive) != os.path.normcase(drive)
+                        and (rtail_nc == tail_nc
+                             or rtail_nc.startswith(tail_nc + os.sep))):
+                    return True
+            return False
+
+        if not any(_affected(r) for r in rows):
+            return stats
+
+        # One-time safety copy before the first destructive merge
+        try:
+            bak = db_path + ".pre-unify.bak"
+            bconn = sqlite3.connect(bak)
+            with bconn:
+                conn.backup(bconn)
+            bconn.close()
+            logging.info("Drive unification: backup written to %s", bak)
+        except Exception:
+            logging.warning("Drive unification: backup failed — continuing",
+                            exc_info=True)
+
+        with conn:
+            for row in rows:
+                rdrive, rtail = os.path.splitdrive(row["file_path"])
+                for drive, tail_nc in tails:
+                    if os.path.normcase(rdrive) == os.path.normcase(drive):
+                        continue          # already on the current letter
+                    rtail_nc = os.path.normcase(rtail)
+                    if not (rtail_nc == tail_nc
+                            or rtail_nc.startswith(tail_nc + os.sep)):
+                        continue          # not under this scan folder
+                    new_path = drive + rtail
+                    keeper = conn.execute(
+                        "SELECT id, status, notes, index_date FROM files "
+                        "WHERE file_path = ?", (new_path,)).fetchone()
+                    if keeper is not None:
+                        # Merge stale row into the current-letter record
+                        if keeper["status"] == "active" and row["status"] != "active":
+                            conn.execute("UPDATE files SET status=? WHERE id=?",
+                                         (row["status"], keeper["id"]))
+                        donor_notes = (row["notes"] or "").strip()
+                        if donor_notes and donor_notes not in (keeper["notes"] or ""):
+                            merged = ((keeper["notes"] or "").strip()
+                                      + "\n" + donor_notes).strip()
+                            conn.execute("UPDATE files SET notes=? WHERE id=?",
+                                         (merged, keeper["id"]))
+                        if row["index_date"] and (not keeper["index_date"]
+                                or row["index_date"] < keeper["index_date"]):
+                            conn.execute("UPDATE files SET index_date=? WHERE id=?",
+                                         (row["index_date"], keeper["id"]))
+                        conn.execute(
+                            "UPDATE file_revisions SET file_id=? WHERE file_id=?",
+                            (keeper["id"], row["id"]))
+                        conn.execute("DELETE FROM dup_group_members WHERE file_id=?",
+                                     (row["id"],))
+                        conn.execute("DELETE FROM files WHERE id=?", (row["id"],))
+                        stats["merged"] += 1
+                    else:
+                        sf = row["source_folder"] or ""
+                        new_sf = drive + os.path.splitdrive(sf)[1] if sf else sf
+                        conn.execute(
+                            "UPDATE files SET file_path=?, source_folder=? "
+                            "WHERE id=?", (new_path, new_sf, row["id"]))
+                        stats["repointed"] += 1
+                    break
+    finally:
+        conn.close()
+    if stats["repointed"] or stats["merged"]:
+        logging.info("Drive unification: %(repointed)d re-pointed, "
+                     "%(merged)d merged", stats)
+    return stats
+
+
+# ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
 

@@ -17,6 +17,7 @@ _MODULES = [
     "test_tz_depth",
     "test_verifier_checks",
     "test_order_search",
+    "test_drive_unify",
 ]
 
 

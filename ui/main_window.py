@@ -6,6 +6,7 @@ import os
 import re
 import json
 import shutil
+import logging
 import datetime
 
 from PyQt6.QtWidgets import (
@@ -738,10 +739,22 @@ class DirectMainWindow(QMainWindow):
                     pass
             folders = cfg.get("scan_folders", [])
             db_path = cfg.get("db_path", "")
+            # Google Drive mounts under a changing letter (G:/P:/Q:...) — if
+            # the stored paths don't exist, find them on the current letter.
+            db_path, db_moved = db.resolve_drive_path(db_path)
+            resolved = []
+            any_moved = db_moved
+            for f in folders:
+                nf, moved = db.resolve_drive_path(f)
+                resolved.append(nf)
+                any_moved = any_moved or moved
+            folders = resolved
             if db_path and os.path.exists(db_path) and folders:
                 self.db_path      = db_path
                 self.scan_folders = [f for f in folders if os.path.isdir(f)]
                 self._on_workspace_ready()
+                if any_moved:
+                    self._save_config()   # remember the current drive letter
             # Restore hidden columns (keyed by column name; old int keys ignored)
             hdr = self._table.horizontalHeader()
             for name in cfg.get("hidden_columns", []):
@@ -917,6 +930,17 @@ class DirectMainWindow(QMainWindow):
         self._save_config()
 
     def _on_workspace_ready(self):
+        # Fold records left over from old Google-Drive letters into the current
+        # one so the same file never exists 2-3x (once per past drive letter)
+        try:
+            stats = db.unify_drive_letters(self.db_path, self.scan_folders)
+            if stats["repointed"] or stats["merged"]:
+                self._status_bar.showMessage(
+                    f"Drive letter changed — {stats['repointed']:,} records "
+                    f"re-pointed, {stats['merged']:,} duplicates merged", 8000)
+        except Exception:
+            logging.exception("Drive unification failed")
+
         short = ", ".join(os.path.basename(f) for f in self.scan_folders)
         self._folder_lbl.setText(f"  {short}")
         self._rescan_btn.setEnabled(True)

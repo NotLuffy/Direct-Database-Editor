@@ -32,7 +32,6 @@ _TOL_ROUND_IN     = 0.01   # round size: exact within 0.01"
 _TOL_CB_EXACT_MM  = 0.01   # CB: exact match (full score)
 _TOL_CB_NEAR_MM   = 0.10   # CB: acceptance limit — ranked after exact matches
 _TOL_CB_MM        = 1.5    # STEP counterbore / 2PC piece CB: looser (rounded notes)
-_TOL_OB_MM        = 2.0    # OB: ±2.0mm
 _TOL_DISC_IN      = 0.06   # disc thickness: ±0.06" (~1.5mm)
 _TOL_HC_IN        = 0.10   # HC height: ±0.10" (order sheets often round)
 
@@ -629,17 +628,21 @@ def score_title_match(params: dict, title: str,
             else:
                 return 0, []
 
-    # ── OB (10 pts, only when order specifies OB) ────────────────────────────
+    # ── OB (10 pts, hard gate like CB) — exact scores full, within 0.1mm
+    #    ranks just below the exact matches, anything further is rejected ─────
     has_ob_field = params["ob_mm"] is not None
     max_ob = 10 if has_ob_field else 0
     if has_ob_field:
         t_ob = specs.get("ob_mm") or specs.get("step_mm")
         p_ob = params["ob_mm"]
-        if t_ob is not None and abs(t_ob - p_ob) <= _TOL_OB_MM:
+        if t_ob is None or abs(t_ob - p_ob) > _TOL_CB_NEAR_MM + 1e-9:
+            return 0, []
+        if abs(t_ob - p_ob) <= _TOL_CB_EXACT_MM:
             raw += 10
             matched.append(f"OB {p_ob:.1f}mm ✓")
         else:
-            missed.append(f"OB {p_ob:.1f}mm ✗" + (f" (title: {t_ob:.1f}mm)" if t_ob else ""))
+            raw += 5
+            matched.append(f"OB {p_ob:.1f}mm ~ (title: {t_ob:.1f}mm)")
 
     # ── HC height (5 pts, hard gate when the order specifies a hub height) ───
     # A 1.00" hub order must never surface .50"/1.25" hub files.

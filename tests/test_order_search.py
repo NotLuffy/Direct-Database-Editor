@@ -322,6 +322,15 @@ def _test_scoring():
     s, _ = osp.score_title_match(hc, '6.5 77.8/106MM ID 0.5 HC')
     _check("wrong CB rejected", s == 0, f"score {s}")
 
+    # OB is a hard gate like CB: exact full, ≤0.1mm ranks after, else rejected
+    ob = osp.parse_order_row('6.25\t5500-5500-CH\t78.1\t71.6\t1.50"+.50"HUB)')
+    s_exact, _ = osp.score_title_match(ob, '6.25 IN DIA 78.1/71.6 1.50  HC XX')
+    s_near, _  = osp.score_title_match(ob, '6.25 IN DIA 78.1/71.5 1.50  HC XX')
+    s_far, _   = osp.score_title_match(ob, '6.25 IN DIA 78.1/73 1.50  HC XX')
+    _check("OB exact above 0.1mm-near above rejected",
+           s_exact > s_near >= osp.MIN_SCORE and s_far == 0,
+           f"exact {s_exact} near {s_near} far {s_far}")
+
     # Thickness equivalents: 1/2" (incl. HC) can use 15MM programs;
     # 19MM can use 3/4" up to 20MM — but not 22MM
     s, _ = osp.score_title_match(hc, '6.5IN DIA 106.1/106 15MM HC .5')

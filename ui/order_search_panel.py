@@ -50,7 +50,7 @@ class _SearchWorker(QThread):
             conn = db.get_connection(self._db_path)
             # Scope to the open workspace folders — same as the main table —
             # so results are files the user can actually see and open.
-            sql = ("SELECT id, o_number, file_name, program_title "
+            sql = ("SELECT id, o_number, file_name, program_title, verify_status "
                    "FROM files "
                    "WHERE program_title IS NOT NULL AND program_title != '' ")
             args = []
@@ -82,7 +82,8 @@ class _SearchWorker(QThread):
                 for row in rows:
                     if self._cancelled:
                         return
-                    score, fields = score_title_match(params, row["program_title"])
+                    score, fields = score_title_match(
+                        params, row["program_title"], row["verify_status"] or "")
                     if score < MIN_SCORE:
                         continue
                     key = (row["o_number"] or "").upper() or str(row["id"])

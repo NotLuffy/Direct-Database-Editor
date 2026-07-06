@@ -278,6 +278,24 @@ def _test_scoring():
     s, _ = osp.score_title_match(flat9, _T_STEP)
     _check("flat order rejects STEP title", s == 0, f"score {s}")
 
+    # Geometry-detected steps: no STEP keyword in the title, but STEP:/SD:
+    # verify tokens.  Program cuts the step ~0.03" deeper than nominal.
+    stp2   = osp.parse_order_row('5.75\t4375-4400-C\t71/60 (.40 Step)\t\t1.50"')
+    t_geo  = '5.75IN DIA 71/60MM ID 1.5 XX'
+    vs_ok  = 'CB:PASS STEP:60.0 SD:0.430"'
+    vs_bad = 'CB:PASS STEP:60.0 SD:0.750"'
+    s, f = osp.score_title_match(stp2, t_geo, vs_ok)
+    _check("token STEP + depth 0.43 fulfils .40 order", s >= 90, f"score {s} {f}")
+    s, _ = osp.score_title_match(stp2, t_geo, vs_bad)
+    _check("wrong step depth rejected", s == 0, f"score {s}")
+    s, _ = osp.score_title_match(stp2, t_geo, 'CB:PASS STEP:60.0')
+    _check("no SD token — depth check skipped", s >= 90, f"score {s}")
+    s, _ = osp.score_title_match(stp2, t_geo)
+    _check("no tokens at all — step order rejects plain title", s == 0, f"score {s}")
+    flat575 = osp.parse_order_row('5.75\t4375-4400-C\t71\t\t1.50"')
+    s, _ = osp.score_title_match(flat575, t_geo, vs_ok)
+    _check("flat order rejects token-STEP file", s == 0, f"score {s}")
+
     # Thickness is a hard gate: same CB/OB/type but wrong disc must be rejected
     hc10 = osp.parse_order_row('8.5\t8180-10H (SPACERS)\t124.1\t124.1\t10MM+.50"HUB)')
     s, _ = osp.score_title_match(hc10, '8.5IN DIA 124.1/124MM 10MM HC')

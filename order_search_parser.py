@@ -36,6 +36,12 @@ _TOL_OB_MM        = 2.0    # OB: ±2.0mm
 _TOL_DISC_IN      = 0.06   # disc thickness: ±0.06" (~1.5mm)
 _TOL_HC_IN        = 0.10   # HC height: ±0.10" (order sheets often round)
 
+# Step depth: programs cut the step ~0.03" DEEPER than the ordered nominal
+# (a Z-0.43 cut fulfils a ".40 STEP" order).  Accepted: nominal … nominal+0.03,
+# with ±0.005 rounding slack.
+_STEP_DEPTH_EXTRA_IN = 0.03
+_STEP_DEPTH_SLACK_IN = 0.005
+
 
 def _disc_equivalents(v: float) -> list[float]:
     """Shop-floor thickness substitutions (one-directional, order → program):
@@ -491,13 +497,18 @@ def describe_params(p: dict) -> str:
 # Scoring
 # ---------------------------------------------------------------------------
 
-def score_title_match(params: dict, title: str) -> tuple[int, list[str]]:
+def score_title_match(params: dict, title: str,
+                      verify_status: str = "") -> tuple[int, list[str]]:
     """
     Score a program title against parsed order params.
 
     Part type is a HARD filter: SR orders only see steel-ring files, HC orders
     only hub files, STD/1pc orders never see 2PC / HC / steel-ring files, and
     STEP orders only STEP files.  Within the allowed type, closeness is scored.
+
+    verify_status (the file's verify tokens) refines matching where titles
+    fall short: geometry-detected steps carry no STEP keyword in the title but
+    do carry STEP:<mm> / SD:<in>" tokens.
 
     Returns (score_0_to_100, matched_fields_list).
     """
@@ -508,10 +519,13 @@ def score_title_match(params: dict, title: str) -> tuple[int, list[str]]:
     if specs is None:
         return 0, []
 
+    vs        = (verify_status or "").upper()
     p_type    = params.get("part_type", "STD")
     p_is_step = bool(params.get("is_step")) and not params.get("is_2pc")
 
-    t_is_step = bool(specs.get("is_step")) or bool(re.search(r'\bSTEP\b', title, re.IGNORECASE))
+    t_is_step = (bool(specs.get("is_step"))
+                 or bool(re.search(r'\bSTEP\b', title, re.IGNORECASE))
+                 or bool(re.search(r'\bSTEP:\d', vs)))
     t_is_2pc  = bool(re.search(r'-*2\s*PC\b', title, re.IGNORECASE))
     t_is_sr   = bool(specs.get("is_steel_ring")) or bool(_STEEL_RE.search(title))
     t_has_hc  = specs.get("hc_height_in") is not None
@@ -581,14 +595,36 @@ def score_title_match(params: dict, title: str) -> tuple[int, list[str]]:
     # ── STEP counterbore (15 pts, only for step orders) ──────────────────────
     max_step = 15 if (p_is_step and params.get("step_cb_mm") is not None) else 0
     if max_step:
-        t_step = specs.get("step_mm")
         p_step = params["step_cb_mm"]
-        if t_step is not None and abs(t_step - p_step) <= _TOL_CB_MM:
+        cands  = []
+        if specs.get("step_mm") is not None:
+            cands.append(specs["step_mm"])
+        m = re.search(r'\bSTEP:(\d+(?:\.\d+)?)', vs)
+        if m:
+            cands.append(float(m.group(1)))
+        # "71/60MM" titles without a STEP keyword put the counterbore in ob_mm
+        if not cands and specs.get("ob_mm") is not None:
+            cands.append(specs["ob_mm"])
+        hit = next((c for c in cands if abs(c - p_step) <= _TOL_CB_MM), None)
+        if hit is not None:
             raw += 15
             matched.append(f"Counterbore {p_step:.1f}mm ✓")
         else:
             missed.append(f"Counterbore {p_step:.1f}mm ✗"
-                          + (f" (title: {t_step:.1f}mm)" if t_step else ""))
+                          + (f" (file: {cands[0]:.1f}mm)" if cands else ""))
+
+        # Step depth (hard gate when both sides are known): the program cuts
+        # ~0.03" deeper than nominal — SD:0.430" fulfils a ".40 STEP" order
+        p_depth = params.get("step_depth_in")
+        m = re.search(r'\bSD:(\d+(?:\.\d+)?)', vs)
+        if p_depth is not None and m:
+            sd = float(m.group(1))
+            lo = p_depth - _STEP_DEPTH_SLACK_IN
+            hi = p_depth + _STEP_DEPTH_EXTRA_IN + _STEP_DEPTH_SLACK_IN
+            if lo <= sd <= hi:
+                matched.append(f'Step depth {p_depth:.2f}" ✓ (cut {sd:.3f}")')
+            else:
+                return 0, []
 
     # ── OB (10 pts, only when order specifies OB) ────────────────────────────
     has_ob_field = params["ob_mm"] is not None

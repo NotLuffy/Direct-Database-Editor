@@ -371,12 +371,14 @@ def parse_order_row(text: str) -> dict | None:
 
         warnings: list[str] = []
         alt_disc_in = None
+        hc_assumed  = False    # hub height guessed, not read — never a hard gate
         th = _parse_thickness(col_m)
         if th is None:
             if j["disc_in"] is None:
                 return None
             hub = j["has_hub"] or ob_mm is not None
             hc  = (j["hub_in"] or 0.50) if hub else None
+            hc_assumed = bool(hub and j["hub_in"] is None)
             th = {"disc_in": j["disc_in"], "hc_in": hc,
                   "is_2pc": False, "piece_a_in": None, "piece_b_in": None}
             warnings.append(
@@ -387,6 +389,7 @@ def parse_order_row(text: str) -> dict | None:
                 if j["hub_in"] is not None:
                     th["hc_in"] = j["hub_in"]
                 else:
+                    hc_assumed = True
                     warnings.append('Hub height not given in thickness — assumed 0.50"')
             if j["disc_in"] is not None and abs(j["disc_in"] - th["disc_in"]) > 0.07:
                 alt_disc_in = j["disc_in"]
@@ -436,10 +439,15 @@ def parse_order_row(text: str) -> dict | None:
                 warnings.append('OB given but no hub height in M — hub height unchecked')
             elif ob_mm is None:
                 warnings.append('Hub in M but no OB value in column L')
+            if not j["has_hub"] and j["disc_in"] is not None:
+                warnings.append('L/M say hub but J has no H code — check row')
+        elif j["has_hub"] and not cb_data["is_step"]:
+            # Column J is a hub check in its own right: an H in the thickness
+            # code means the part has a hub even when L and M don't show one
+            part_type = "HC"
+            warnings.append('Hub taken from J thickness code (no OB in L, no hub in M)')
         else:
             part_type = "STD"
-            if j["has_hub"]:
-                warnings.append('J suggests a hub but L and M do not — treating as flat')
 
         return {
             "round_in":          round_in,
@@ -456,6 +464,7 @@ def parse_order_row(text: str) -> dict | None:
             "disc_in":           th["disc_in"],
             "alt_disc_in":       alt_disc_in,
             "hc_in":             th["hc_in"],
+            "hc_assumed":        hc_assumed,
             "is_2pc":            is_2pc,
             "is_hc_2pc":         is_hc_2pc,
             # HC 2PC: hub bore CB for the B (hub/hat) piece, from col L
@@ -645,7 +654,9 @@ def score_title_match(params: dict, title: str,
             matched.append(f"OB {p_ob:.1f}mm ~ (title: {t_ob:.1f}mm)")
 
     # ── HC height (5 pts, hard gate when the order specifies a hub height) ───
-    # A 1.00" hub order must never surface .50"/1.25" hub files.
+    # A 1.00" hub order must never surface .50"/1.25" hub files — but when the
+    # hub height was only ASSUMED (unreadable M), it scores softly instead:
+    # a guess must never reject the right file.
     has_hc_field = params["hc_in"] is not None
     max_hc = 5 if has_hc_field else 0
     if has_hc_field:
@@ -654,6 +665,9 @@ def score_title_match(params: dict, title: str,
         if t_hc is not None and abs(t_hc - p_hc) <= _TOL_HC_IN:
             raw += 5
             matched.append(f'HC {p_hc:.3f}" ✓')
+        elif params.get("hc_assumed"):
+            missed.append(f'HC {p_hc:.3f}"? (assumed)'
+                          + (f' (title: {t_hc:.3f}")' if t_hc else ""))
         else:
             return 0, []
 

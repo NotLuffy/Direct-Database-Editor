@@ -234,6 +234,20 @@ def _test_rows():
     _check("4-column row (no L)", p is not None and p["part_type"] == "STD"
            and _close(p["disc_in"], 1.0), f"got {p}")
 
+    # Column J is a hub check on its own: H code makes the order HC even
+    # when L is empty and M shows no hub
+    p = osp.parse_order_row('6.5\t6550-1/2H (SPACERS)\t78.1\t\t1/2"')
+    _check("J H-code makes order HC", p is not None and p["part_type"] == "HC"
+           and p["hc_in"] is None and p["warnings"], f"got {p}")
+
+    # Assumed hub height (unreadable M) must be soft — it may not reject a
+    # file whose hub is different from the 0.50\" guess
+    p = osp.parse_order_row('6.5\t6550-10H (SPACERS)\t78.1\t78.1\t?')
+    _check("assumed hub flagged", p is not None and p["hc_assumed"], f"got {p}")
+    s, _ = osp.score_title_match(p, '6.5IN DIA 78.1/78.1 10MM HC 1.0')
+    _check("assumed hub does not reject 1.0-hub file", s >= osp.MIN_SCORE,
+           f"score {s}")
+
 
 # ---------------------------------------------------------------------------
 # Scoring — hard part-type gates

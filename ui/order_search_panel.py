@@ -103,7 +103,8 @@ class _SearchWorker(QThread):
                         if self._cancelled:
                             return
                         s, fields = score_modification_base(
-                            params, row["program_title"])
+                            params, row["program_title"],
+                            row["verify_status"] or "")
                         if s < MIN_SUGGEST_SCORE:
                             continue
                         key = (row["o_number"] or "").upper() or str(row["id"])

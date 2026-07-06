@@ -523,12 +523,15 @@ def score_title_match(params: dict, title: str,
     p_type    = params.get("part_type", "STD")
     p_is_step = bool(params.get("is_step")) and not params.get("is_2pc")
 
-    t_is_step = (bool(specs.get("is_step"))
-                 or bool(re.search(r'\bSTEP\b', title, re.IGNORECASE))
-                 or bool(re.search(r'\bSTEP:\d', vs)))
-    t_is_2pc  = bool(re.search(r'-*2\s*PC\b', title, re.IGNORECASE))
-    t_is_sr   = bool(specs.get("is_steel_ring")) or bool(_STEEL_RE.search(title))
-    t_has_hc  = specs.get("hc_height_in") is not None
+    # Classify the file exactly like the app's Type column does (title +
+    # verify tokens) so search results always agree with the table.
+    from direct_models import _part_type as _app_part_type
+    t_type    = _app_part_type(title, vs)
+    t_is_step = (t_type == "STEP")
+    t_is_2pc  = t_type.startswith("2PC")
+    t_is_sr   = (t_type == "STEEL")
+    t_has_hc  = (specs.get("hc_height_in") is not None
+                 or t_type in ("HC", "15MM HC"))
 
     # ── Hard part-type gates ─────────────────────────────────────────────────
     if p_type == "SR":
@@ -665,7 +668,8 @@ def score_title_match(params: dict, title: str,
 MIN_SUGGEST_SCORE = 40
 
 
-def score_modification_base(params: dict, title: str) -> tuple[int, list[str]]:
+def score_modification_base(params: dict, title: str,
+                            verify_status: str = "") -> tuple[int, list[str]]:
     """
     Similarity score for suggesting an existing program to MODIFY when no
     program matches the order (custom requests etc.).
@@ -680,9 +684,11 @@ def score_modification_base(params: dict, title: str) -> tuple[int, list[str]]:
     if specs is None:
         return 0, []
 
+    from direct_models import _part_type as _app_part_type
     p_type   = params.get("part_type", "STD")
-    t_is_2pc = bool(re.search(r'-*2\s*PC\b', title, re.IGNORECASE))
-    t_is_sr  = bool(specs.get("is_steel_ring")) or bool(_STEEL_RE.search(title))
+    t_type   = _app_part_type(title, (verify_status or "").upper())
+    t_is_2pc = t_type.startswith("2PC")
+    t_is_sr  = (t_type == "STEEL")
     if t_is_2pc != (p_type == "2PC") or t_is_sr != (p_type == "SR"):
         return 0, []
 
